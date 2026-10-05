@@ -1,1 +1,5 @@
 BRIEF.md
+target/
+node_modules/
+.wrangler/
+build/

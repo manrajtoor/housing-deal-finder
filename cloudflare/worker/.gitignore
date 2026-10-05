@@ -1,0 +1,5 @@
+.dev.vars
+build/
+target/
+.wrangler/
+node_modules/

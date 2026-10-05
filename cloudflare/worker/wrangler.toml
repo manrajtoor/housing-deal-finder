@@ -1,0 +1,52 @@
+# housedeals API Worker (Rust, workers-rs). Nothing here is deployed until
+# you run `npx wrangler deploy` yourself.
+
+name = "housedeals-api"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+account_id = "7377038a87d0e600e53c1e5039c7b89a"
+
+# Public at https://housedeals-api.<subdomain>.workers.dev: /api/health and
+# the bearer-protected crawler routes. Reads answer only through the Pages
+# service binding (host housedeals-api.internal) unless PUBLIC_READ_API.
+workers_dev = true
+
+# Compiles src/ to wasm with worker-build; `wrangler dev` and `wrangler deploy` run it.
+[build]
+command = "node build.mjs"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "housedeals"
+database_id = "19535651-3d62-444e-9249-c0fc0947c7dc"
+migrations_dir = "../d1/migrations"
+
+# Cron -> workflow_dispatch of crawl.yml with input `mode` (src/dispatch.rs):
+#   */30 * * * *  quick  newest page per search, then needs-detail
+#   0 11 * * *    full   every page, needs-detail; this cron also expires
+#                        active listings unseen for EXPIRE_AFTER_DAYS
+#   0 12 * * 0    sold   Michigan sold comps (Sundays)
+# Cron times are UTC.
+[triggers]
+crons = ["*/30 * * * *", "0 11 * * *", "0 12 * * 0"]
+
+[vars]
+GITHUB_REPO = "manrajtoor/housing-deal-finder"
+GITHUB_WORKFLOW = "crawl.yml"
+# "false": /api/deals, /api/alerts, /api/stats only via the Pages binding.
+# .dev.vars sets "true" for local curl testing.
+PUBLIC_READ_API = "false"
+EXPIRE_AFTER_DAYS = "3"
+# Alert rule (scorer::AlertRule): Deal.alert and new rows in deal_alerts.
+ALERT_MAX_PRICE = "900000"
+ALERT_MIN_DISCOUNT_PCT = "15"
+ALERT_MIN_COMPS_NYC = "8"
+ALERT_MIN_COMPS_MI = "6"
+
+# Secrets (never in this file):
+#   INGEST_TOKEN           npx wrangler secret put INGEST_TOKEN   (local: .dev.vars)
+#   GITHUB_DISPATCH_TOKEN  npx wrangler secret put GITHUB_DISPATCH_TOKEN
+#                          fine-grained, this repo only, Actions read/write
+
+[observability]
+enabled = true

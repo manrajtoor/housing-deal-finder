@@ -1,0 +1,73 @@
+# Crawl StreetEasy (NYC) and Zillow (northern Michigan) and push the listings
+# to the housedeals Worker (POST /api/listings), then read the detail pages
+# the Worker asks for (needs-detail) and push those too.
+#
+# No schedule: the Worker's crons call workflow_dispatch (GitHub's schedule is
+# unreliable at short intervals):
+#   */30 * * * *  mode=quick  newest page of each search, <= 15 detail pages
+#   0 11 * * *    mode=full   every page of each search, <= 40 detail pages
+#   0 12 * * 0    mode=sold   Michigan homes sold in the last 12 months
+#
+# Setup (once, in the GitHub repo): Settings > Secrets and variables > Actions
+#   Secrets   > HOUSEDEALS_INGEST_TOKEN = the Worker's INGEST_TOKEN
+#   Variables > HOUSEDEALS_API_URL      = https://housedeals-api.<you>.workers.dev
+# Until HOUSEDEALS_API_URL is set, runs are skipped (so forks stay quiet).
+#
+# Politeness: one job at a time (concurrency), one request at a time inside
+# it, 1.5 s between requests, a normal browser User-Agent, and a source stops
+# at its first error.
+name: crawl
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "quick (newest page), full (every page) or sold (Michigan sold comps)"
+        type: choice
+        options: [quick, full, sold]
+        default: quick
+        required: true
+
+permissions:
+  contents: read
+
+# Never two crawls at once: a slow run makes the next one wait, not overlap.
+concurrency:
+  group: crawl
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    if: vars.HOUSEDEALS_API_URL != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: crawler
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: crawler/go.mod
+          cache: false # no dependencies, so no go.sum to key a cache on
+
+      - name: Check configuration
+        env:
+          HOUSEDEALS_INGEST_TOKEN: ${{ secrets.HOUSEDEALS_INGEST_TOKEN }}
+          HOUSEDEALS_API_URL: ${{ vars.HOUSEDEALS_API_URL }}
+        run: |
+          [ -n "$HOUSEDEALS_INGEST_TOKEN" ] || { echo "::error::repository secret HOUSEDEALS_INGEST_TOKEN is not set"; exit 1; }
+          case "$HOUSEDEALS_API_URL" in https://*) ;; *) echo "::error::HOUSEDEALS_API_URL must start with https://"; exit 1;; esac
+
+      - name: Build the crawler
+        run: go build -trimpath -o "$RUNNER_TEMP/housedeals" ./cmd/housedeals
+
+      - name: Crawl and push
+        env:
+          HOUSEDEALS_INGEST_TOKEN: ${{ secrets.HOUSEDEALS_INGEST_TOKEN }}
+          HOUSEDEALS_API_URL: ${{ vars.HOUSEDEALS_API_URL }}
+          MODE: ${{ inputs.mode || 'quick' }}
+        run: |
+          case "$MODE" in quick|full|sold) ;; *) echo "::error::mode must be quick, full or sold"; exit 1;; esac
+          "$RUNNER_TEMP/housedeals" --mode "$MODE" --market all --push "$HOUSEDEALS_API_URL"

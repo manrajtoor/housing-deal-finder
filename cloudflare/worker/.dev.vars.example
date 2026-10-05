@@ -1,0 +1,4 @@
+# Copy to .dev.vars for `npx wrangler dev`. .dev.vars is git-ignored.
+INGEST_TOKEN=devtoken
+PUBLIC_READ_API=true
+# GITHUB_DISPATCH_TOKEN=   (leave unset locally: the crons only log)

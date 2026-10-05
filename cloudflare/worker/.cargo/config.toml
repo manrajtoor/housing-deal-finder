@@ -1,0 +1,14 @@
+# Native builds on Windows (cargo test, and the host build scripts that
+# worker-build compiles): link the MSVC C runtime statically.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# When cross-compiling to wasm32, cargo does not apply the rustflags above to
+# build scripts. `build.mjs` sets RUSTC_BOOTSTRAP=1 on Windows so these
+# (otherwise nightly-only) settings take effect. Other platforms ignore this.
+[unstable]
+host-config = true
+target-applies-to-host = true
+
+[host]
+rustflags = ["-C", "target-feature=+crt-static"]

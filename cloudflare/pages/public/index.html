@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; img-src 'self' https:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="light dark">
+  <title>House deals</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <h1>House deals</h1>
+      <p class="sub">Homes asking well under what comparable homes ask.</p>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="Market">
+      <button type="button" role="tab" id="tab-nyc" data-market="nyc" aria-controls="main" aria-selected="true">NYC apartments</button>
+      <button type="button" role="tab" id="tab-mi" data-market="mi" aria-controls="main" aria-selected="false">Michigan waterfront</button>
+    </nav>
+  </header>
+
+  <main id="main" role="tabpanel">
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+
+    <section aria-labelledby="alerts-h">
+      <div class="section-head">
+        <h2 id="alerts-h">New deals</h2>
+        <span id="alerts-note" class="muted"></span>
+      </div>
+      <div id="alerts" class="cards"></div>
+    </section>
+
+    <section aria-labelledby="deals-h">
+      <div class="section-head">
+        <h2 id="deals-h">All scored listings</h2>
+        <span id="deals-count" class="muted"></span>
+      </div>
+      <form id="filters" class="filters" autocomplete="off">
+        <label>Max price
+          <input name="maxPrice" type="number" inputmode="numeric" min="0" step="10000" value="900000">
+        </label>
+        <label>Min under %
+          <input name="minDiscount" type="number" inputmode="decimal" step="1" value="0">
+        </label>
+        <label>Home type
+          <select name="homeType"><option value="">Any</option></select>
+        </label>
+        <label data-market="nyc">Borough
+          <select name="borough"><option value="">Any</option></select>
+        </label>
+        <label data-market="nyc">Neighbourhood
+          <select name="neighborhood"><option value="">Any</option></select>
+        </label>
+        <label data-market="mi">Area
+          <select name="area">
+            <option value="">Any</option>
+            <option value="traverse">Traverse</option>
+            <option value="petoskey">Petoskey</option>
+          </select>
+        </label>
+        <label data-market="mi">Water
+          <select name="waterType">
+            <option value="">Any</option>
+            <option value="great_lakes">Great Lakes</option>
+            <option value="inland">Inland lake</option>
+            <option value="access">Access only</option>
+            <option value="other">Other</option>
+            <option value="unknown">Not read yet</option>
+          </select>
+        </label>
+        <label>Rows
+          <select name="limit">
+            <option>100</option>
+            <option selected>200</option>
+            <option>500</option>
+          </select>
+        </label>
+      </form>
+      <div class="table-wrap" tabindex="0" aria-label="Scored listings, scrolls sideways">
+        <table id="deals">
+          <thead><tr></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="legend muted">Under % = how far the price sits below the baseline from comparable listings (medians).
+        Comps marked * come from a wider fallback group and never alert. Zestimate is a second opinion only.</p>
+    </section>
+  </main>
+
+  <footer id="stats" class="stats"></footer>
+
+  <script src="app.js" defer></script>
+</body>
+</html>

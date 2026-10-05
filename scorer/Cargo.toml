@@ -1,0 +1,15 @@
+[package]
+name = "housedeals-scorer"
+version = "0.1.0"
+edition = "2021"
+description = "Comp-based baselines and deal scores for housedeals (NYC apartments, northern Michigan waterfront)"
+publish = false
+
+[lib]
+name = "scorer"
+path = "src/lib.rs"
+
+# Pure Rust, no wasm or Workers dependencies: the Worker links it, and
+# `cargo test` runs it natively.
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }

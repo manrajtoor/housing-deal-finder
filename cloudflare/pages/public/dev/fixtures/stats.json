@@ -1,0 +1,62 @@
+{
+ "generatedAt": "2026-10-05T15:40:00Z",
+ "counts": [
+  {
+   "market": "nyc",
+   "status": "active",
+   "n": 5874
+  },
+  {
+   "market": "nyc",
+   "status": "expired",
+   "n": 312
+  },
+  {
+   "market": "mi",
+   "status": "active",
+   "n": 412
+  },
+  {
+   "market": "mi",
+   "status": "sold",
+   "n": 158
+  }
+ ],
+ "alerts": [
+  {
+   "market": "nyc",
+   "n": 6
+  },
+  {
+   "market": "mi",
+   "n": 5
+  }
+ ],
+ "crawls": [
+  {
+   "market": "nyc",
+   "mode": "quick",
+   "at": "2026-10-05T15:31:00Z"
+  },
+  {
+   "market": "nyc",
+   "mode": "full",
+   "at": "2026-10-05T11:00:00Z"
+  },
+  {
+   "market": "mi",
+   "mode": "quick",
+   "at": "2026-10-05T15:29:00Z"
+  },
+  {
+   "market": "mi",
+   "mode": "full",
+   "at": "2026-10-05T10:58:00Z"
+  },
+  {
+   "market": "mi",
+   "mode": "sold",
+   "at": "2026-10-04T12:20:00Z"
+  }
+ ]
+}
