@@ -231,7 +231,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// Asks GitHub to start `crawl.yml` with `mode`. Logs and returns on any failure.
 async fn dispatch_crawl(env: &Env, mode: &str) {
     let Some(cfg) = DispatchConfig::from_vars(|k| var(env, k), mode) else {
-        console_log!("crawl dispatch ({mode}): off (GITHUB_DISPATCH_TOKEN, GITHUB_REPO or GITHUB_WORKFLOW not set)");
+        console_log!("crawl dispatch ({mode}): off (GITHUB_DISPATCH_TOKEN, GITHUB_REPO or GITHUB_WORKFLOW not set, or the token has spaces or non-ASCII characters)");
         return;
     };
     let result = async {

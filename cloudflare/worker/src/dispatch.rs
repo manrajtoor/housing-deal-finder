@@ -53,8 +53,14 @@ impl DispatchConfig {
         if !ok(owner) || !ok(name) || !ok(&workflow) {
             return None;
         }
+        // A GitHub token is printable ASCII without spaces; anything else
+        // (a pasted command, a line break) would only fail as a bad header.
+        let token = val("GITHUB_DISPATCH_TOKEN")?;
+        if !token.chars().all(|c| c.is_ascii_graphic()) {
+            return None;
+        }
         Some(DispatchConfig {
-            token: val("GITHUB_DISPATCH_TOKEN")?,
+            token,
             repo,
             workflow,
             git_ref: val("GITHUB_REF").unwrap_or_else(|| "main".to_string()),
@@ -125,6 +131,12 @@ mod tests {
         assert!(h.contains(&("X-GitHub-Api-Version", "2022-11-28".to_string())));
         assert!(h.contains(&("Authorization", "Bearer tok".to_string())));
         assert!(h.iter().any(|(k, _)| *k == "User-Agent"));
+    }
+
+    #[test]
+    fn off_with_a_malformed_token() {
+        let pasted = |k: &str| if k == "GITHUB_DISPATCH_TOKEN" { Some("pbpaste | npx wrangler\nsecret".into()) } else { vars(k) };
+        assert!(DispatchConfig::from_vars(pasted, "quick").is_none());
     }
 
     #[test]
