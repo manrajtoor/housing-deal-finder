@@ -356,16 +356,17 @@ fn fresh_listings_alert_for_72_hours_only() {
 }
 
 #[test]
-fn a_thin_neighbourhood_falls_back_to_the_borough() {
+fn a_thin_neighbourhood_is_refused_not_priced_borough_wide() {
+    // The scorer has no borough fallback (DESIGN.md "Scorer"): nine Sunnyside
+    // comps do not price a Woodside listing.
     let db = Db::new();
     let comps: Vec<Value> = (0..9).map(|i| apt(&format!("se:s{i}"), "Sunnyside", 800_000, 40)).collect();
     push(&db, comps, "nyc", "full", NOW);
     push(&db, vec![apt("se:w", "Woodside", 640_000, 1)], "nyc", "quick", LATER);
     let j = job(&db, "nyc", LATER);
-    assert_eq!(j.alerts, 0, "thin groups never alert");
-    let d = db.deal("se:w");
-    assert_eq!((d["group"].as_str(), d["thin"].as_bool(), d["n"].as_f64()), (Some("Queens · condo · 2bd"), Some(true), Some(9.0)));
-    assert_eq!(d["alert"], false);
+    assert_eq!(j.alerts, 0);
+    assert!(db.deal("se:w").is_null(), "refused, not stored");
+    assert_eq!(db.count("SELECT COUNT(*) FROM listing_scores"), 9, "the Sunnyside comps price each other");
 }
 
 #[test]

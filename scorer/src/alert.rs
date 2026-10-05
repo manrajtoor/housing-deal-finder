@@ -3,7 +3,7 @@
 //! listing the crawler did not mark comp-only, and in Michigan only
 //! `great_lakes` or `inland` frontage: unread (`other`), river/pond and
 //! shared `access` listings are scored but never alert.
-//! The 50% plausibility cap is enforced by the scorer itself (it refuses).
+//! The 40% plausibility cap is enforced by the scorer itself (it refuses).
 
 use crate::listing::{Facts, Market};
 use crate::score::Score;

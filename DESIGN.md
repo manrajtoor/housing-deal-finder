@@ -48,18 +48,66 @@ comps at $900k would drag every baseline down and hide real deals.
 
 ## Scorer (new Rust crate, same rules as the car scorer)
 
-Medians, never means. A group with too few comps does not get a price.
+Medians, never means. A group with too few comps does not get a price, and
+the scorer refuses rather than guesses (see "Calibration" for why).
 
-**NYC.** A listing is priced at the group median of price per sq ft × its sq ft.
-Groups, tried in order until one has enough comps:
+**NYC.** Only apartments: condos and co-ops are subjects and comps;
+houses, townhouses, multi-family buildings and StreetEasy's unknown types
+are refused ("not an apartment") and are not comps. One group, beds always
+matching, condos and co-ops never mixed:
 
-1. neighbourhood × building type (condo / co-op) × beds (2, 3, 4+)
-2. neighbourhood × building type
-3. borough × building type × beds (thin, marked `*`)
+1. borough × neighbourhood × building type (condo / co-op) × beds (2, 3, 4+)
 
-Without sq ft (common for co-ops), the median asking price of the same group
-is used instead. Co-op maintenance is not on search cards; it is fetched from
-the detail page for alert candidates only and shown next to the alert.
+(The borough is in the key because StreetEasy reuses area names: Murray
+Hill is in Manhattan and in Queens.) There is no wider fallback: the old
+"neighbourhood × type" level mixed 2- and 4-bedroom units and the "borough
+× type × beds" level priced e.g. a Starrett City condo against all of
+Brooklyn (n = 317), so a listing whose group cannot price it is refused.
+
+With a usable sq ft the comps are the group's units within **±35%** of the
+subject's size, and each comp's price is moved to the subject's size with
+a size elasticity: `value = comp price × (subject sqft / comp sqft)^b`; the
+baseline is the median value. $/sq ft falls with size (b < 1), so a flat
+median $/sq ft overprices large units (a 2 230 sf Homecrest condo came out
+at $1.67M). `b` is estimated on every run as the pooled Theil–Sen slope
+(median of pairwise slopes of log price on log sq ft, pairs of comps in the
+same group differing by ≥ 15% in size), per building type, clamped to
+0.3-1.0: 0.67 for condos and ≥ 1 (so 1.0) for co-ops on the 2026-10-05
+data, whose co-op sq ft are often round agent estimates. Defaults (condo
+0.7, co-op 0.9) apply with fewer than 200 pairs. The Deal's `medianPpsf`,
+`p25`, `p75` are the comps' $/sq ft at the subject's size.
+
+Without sq ft (common for co-ops), the median asking price of the group's
+units with the same baths (1, 1.5, 2, 2.5+: a size proxy) is used, and only
+when that group is tight ((p75 − p25) / median ≤ 0.35, against 0.75 for
+$/sq ft). A subject with sq ft is never priced by the median price of comps
+without one.
+
+Refused as well, and never comps:
+- restricted or special sales, by neighbourhood (Starrett City, Spring
+  Creek, Co-op City, Rochdale Village, Penn South: Mitchell-Lama) or by words
+  in the address, unit or description (HDFC, Mitchell-Lama, income limits,
+  affordable housing, auction, land/ground lease, leasehold, 55+, age
+  restricted, timeshare, fractional, life estate). StreetEasy cards have no
+  description, so in NYC this mostly catches the neighbourhoods;
+- units of a "cheap building": when the other listings at the same address
+  (and type) ask, at the median, ≥ 10% under their own comps, the whole
+  building is cheap for a reason comps cannot see (restrictions, land lease,
+  high maintenance, sponsor terms). Three 246 E 51st St co-ops at $450k and
+  555 Kappock St co-ops were such cases. 126 units on the 2026-10-05 data.
+
+Co-op maintenance is not on search cards; it is fetched from the detail
+page for alert candidates only and shown next to the alert.
+
+**The $1.5M crawl ceiling.** In a group whose true median is near or above
+$1.5M the crawl sees only the cheaper part, so its median is biased down
+(and the units it does see are the smaller or worse ones). Both markets: a
+group where more than a third of the picked comps ask ≥ $1.35M (90% of the
+ceiling) is refused ("at the crawl ceiling"; 125 NYC listings). The bias is
+conservative (a low baseline hides deals rather than inventing them), so
+the rule is about not showing misleading baselines more than about false
+alerts; on this data the refused groups' discounts were distributed like
+the rest.
 
 **Michigan.** Water facts come from the map at search time (below) and,
 when a detail page can be read, from the description, which then wins:
@@ -67,8 +115,11 @@ when a detail page can be read, from the description, which then wins:
 Michigan and its bays: Grand Traverse, West/East Bay, Little Traverse,
 Suttons), `inland` (Torch, Elk, Glen, Leelanau, Crystal, Walloon, Charlevoix,
 Burt, Crooked, …), `access` (shared/deeded/association access: never alerts),
-`other` (river, pond, unknown). The price is the group median of price per sq ft
-of living area × sq ft. Groups:
+`other` (river, pond, unknown). Every home type is priced (they are mostly
+houses). The price is size-adjusted like NYC's: comps within **±50%** of
+the subject's living area (fewer comps up north), moved to its size with
+one Michigan elasticity (0.67 on the 2026-10-05 data, default 0.6).
+Groups:
 
 1. area × water type
 2. all six counties × water type (thin)
@@ -116,8 +167,12 @@ Comps are active listings plus homes sold in the last 12 months. The sold ones
 use their sale price, which tends to sit a little under asking, so the
 baseline is conservative and alerts lean toward fewer false positives.
 
-**Alert rule:** ≥ 15% under baseline, ≥ 6 comps (Michigan) or ≥ 8 (NYC), not
-thin, price ≤ $900k, discount ≤ 50% (bigger means bad data), and in
+**Alert rule:** ≥ 25% under baseline (the `housedeals-score` default; see
+Calibration for why not 15%), ≥ 6 comps (Michigan) or ≥ 8 (NYC), not
+thin, price ≤ $900k, discount ≤ 40% (bigger is refused as implausible: on the
+2026-10-05 data the 15 NYC listings over 40% were older, plainer buildings
+priced against newer ones, e.g. Forest Hills and Brighton Beach condos, not
+40% bargains), and in
 Michigan only `great_lakes` or `inland` water, from the description or the
 map (unknown, `other` and `access` listings are scored but never alert).
 The Zestimate is shown next to the alert as a second opinion, never used in
@@ -125,6 +180,41 @@ the score. The rule's numbers are `housedeals-score` flags with these
 defaults. A listing alerts only while fresh: the Worker records `fresh_at`
 when a listing is new and young in a quick crawl (not a market's first run),
 relisted or cheaper, and the scorer alerts on it for 72 hours from then.
+
+**Calibration.** `cargo run --release --features calibrate --bin calibrate
+-- d1-export.sql [--water map.txt]` (scorer/src/bin/calibrate.rs; SQLite
+only in that feature) loads a `wrangler d1 export`, scores each market as
+the crawl job does (same columns as score-input: no lat/lon, no
+description) and prints the share priced, the discount distribution and
+counts ≥ 15% / ≥ 40% by level, basis, type, borough or water, the refusals
+by reason, and the top listings with their group, n, basis, sq ft and comps'
+p25/p75. `--water` fills Michigan water from `id|type|body` lines (the map
+classifier's output for the rows' lat/lon); `--set name=value` tries other
+Options. Results on the 2026-10-05 export (4 345 NYC, 248 Michigan rows,
+Michigan water filled from the map):
+
+| | priced | p5 | p25 | median | p75 | p95 | ≥ 15% | ≥ 40% |
+|---|---|---|---|---|---|---|---|---|
+| NYC before (all types) | 4 161 / 4 345 | −57.4 | −17.9 | −0.6 | 14.8 | 34.6 | 1 026 (25%) | 117 |
+| NYC after (apartments) | 905 / 2 684 | −37.1 | −15.0 | −2.7 | 9.1 | 24.8 | 133 (15%) | 0 |
+| Michigan before | 231 / 248 | −104 | −38.8 | −2.8 | 18.8 | 39.8 | 66 (29%) | 11 |
+| Michigan after | 213 / 248 | −73.3 | −26.8 | −4.3 | 13.4 | 30.1 | 50 (23%) | 0 |
+
+The pile-up at the cap is gone and the middle is tighter, but about one
+priced NYC listing in seven is still ≥ 15% under. That share barely moved
+with any comp rule tried (size window 25-70%, min comps 8-20, spread caps
+0.25-0.75, radius-based comps from lat/lon, baths matching, building
+adjustment): asking prices of similar units differ by more than the
+features on a search card explain. Even units of the same building with the
+same beds, baths and sq ft within 10% differ by a median 5.8% in $/sq ft,
+and across buildings of one neighbourhood maintenance, condition, floor
+and building quality add more (comps' p25-p75 is about ±10%). So 15% under
+is roughly a 1-sigma event in NYC and about a 0.7-sigma one up north. A
+≥ 15% discount marks a listing worth a look, not a bargain; the alert
+threshold, not the model, sets how rare alerts are (NYC's p95 is ~25%), so
+the live threshold is 25% (`--min-discount` to change it).
+Sharper baselines would need building-level facts (year built, maintenance
+for every co-op, lat/lon in score-input for radius comps).
 
 **Stored scores.** The scorer scores every active listing of the market
 against all of its rows and rewrites a stored score only when it is missing,

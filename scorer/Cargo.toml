@@ -14,7 +14,20 @@ path = "src/lib.rs"
 name = "housedeals-score"
 path = "src/bin/housedeals-score.rs"
 
+# Calibration harness (DESIGN.md "Calibration"): scores a D1 export and prints
+# the discount distribution. Only built with `--features calibrate`, so the
+# library, housedeals-score and the Worker stay free of SQLite.
+#   cargo run --release --features calibrate --bin calibrate -- d1-export.sql
+[[bin]]
+name = "calibrate"
+path = "src/bin/calibrate.rs"
+required-features = ["calibrate"]
+
+[features]
+calibrate = ["dep:rusqlite"]
+
 # Pure Rust, no wasm or Workers dependencies (the Worker links it for its
 # date helpers), and `cargo test` runs it natively.
 [dependencies]
 serde_json = { version = "1", features = ["preserve_order"] }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }

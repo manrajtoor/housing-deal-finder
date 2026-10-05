@@ -1,13 +1,16 @@
 //! Comp groups, in the order DESIGN.md tries them.
 //!
-//! NYC:
+//! NYC (condos and co-ops only; beds always match):
 //!   1. neighbourhood × home type × beds bucket (2, 3, 4+)
-//!   2. neighbourhood × home type
-//!   3. borough × home type × beds bucket            (thin)
+//!   There is no wider NYC level: a whole neighbourhood mixes unit sizes
+//!   and a borough mixes markets, so a listing whose neighbourhood × type ×
+//!   beds group cannot price it is refused.
 //! Michigan:
 //!   1. area × water type
 //!   2. all six counties × water type                 (thin)
 //!
+//! Inside a group the scorer still picks the comps per listing (similar
+//! size, same baths when pricing without sq ft): see `score`.
 //! A listing belongs to every group whose key parts it has; a listing missing
 //! a part (no neighbourhood, no beds, ...) simply skips that level.
 
@@ -16,8 +19,6 @@ use crate::listing::{Facts, Market};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Level {
     NycBeds,
-    NycType,
-    NycBorough,
     MiArea,
     MiAll,
 }
@@ -25,11 +26,11 @@ pub enum Level {
 impl Level {
     /// A fallback group: its baseline is shown but never alerts.
     pub fn thin(self) -> bool {
-        matches!(self, Level::NycBorough | Level::MiAll)
+        matches!(self, Level::MiAll)
     }
 }
 
-/// One concrete group, e.g. (NycBeds, "Astoria|condo|2").
+/// One concrete group, e.g. (NycBeds, "queens|Astoria|condo|2").
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GroupKey {
     pub level: Level,
@@ -46,9 +47,10 @@ pub fn beds_bucket(beds: Option<i64>) -> Option<&'static str> {
     })
 }
 
-/// The groups `f` belongs to, in fallback order.
+/// The groups `f` belongs to, in fallback order. NYC homes that are not
+/// apartments belong to none.
 pub fn groups_of(f: &Facts) -> Vec<GroupKey> {
-    let mut out = Vec::with_capacity(3);
+    let mut out = Vec::with_capacity(2);
     let mut push = |level: Level, parts: &[Option<&str>]| {
         if parts.iter().all(Option::is_some) {
             let key = parts.iter().map(|p| p.unwrap()).collect::<Vec<_>>().join("|");
@@ -57,12 +59,14 @@ pub fn groups_of(f: &Facts) -> Vec<GroupKey> {
     };
     let ht = Some(f.home_type.as_str());
     match f.market {
-        Market::Nyc => {
-            let bucket = beds_bucket(f.beds);
-            push(Level::NycBeds, &[f.neighborhood.as_deref(), ht, bucket]);
-            push(Level::NycType, &[f.neighborhood.as_deref(), ht]);
-            push(Level::NycBorough, &[f.borough.as_deref(), ht, bucket]);
+        Market::Nyc if f.priced_type() => {
+            // The borough is part of the key: StreetEasy reuses area names
+            // (Murray Hill is in Manhattan and Queens, Bay Terrace and
+            // Sunnyside in Queens and Staten Island).
+            let borough = Some(f.borough.as_deref().unwrap_or(""));
+            push(Level::NycBeds, &[borough, f.neighborhood.as_deref(), ht, beds_bucket(f.beds)]);
         }
+        Market::Nyc => {}
         Market::Mi => {
             push(Level::MiArea, &[f.area.as_deref(), Some(f.water.as_str())]);
             push(Level::MiAll, &[Some(f.water.as_str())]);
@@ -89,17 +93,13 @@ fn home_type_label(t: &str) -> String {
     }
 }
 
-/// Human label, e.g. `Astoria · condo · 2bd`, `Queens · co-op · 4+bd`,
+/// Human label, e.g. `Astoria · condo · 2bd`, `Astoria · co-op · 4+bd`,
 /// `Traverse · inland`, `All six counties · great lakes`.
 pub fn label(g: &GroupKey) -> String {
     let p: Vec<&str> = g.key.split('|').collect();
     let beds = |b: &str| if b == "1" { "0-1bd".to_string() } else { format!("{b}bd") };
     match g.level {
-        Level::NycBeds | Level::NycBorough => {
-            let place = if g.level == Level::NycBorough { title(p[0]) } else { p[0].to_string() };
-            format!("{place} · {} · {}", home_type_label(p[1]), beds(p[2]))
-        }
-        Level::NycType => format!("{} · {}", p[0], home_type_label(p[1])),
+        Level::NycBeds => format!("{} · {} · {}", p[1], home_type_label(p[2]), beds(p[3])),
         Level::MiArea => format!("{} · {}", title(p[0]), p[1].replace('_', " ")),
         Level::MiAll => format!("All six counties · {}", p[0].replace('_', " ")),
     }
@@ -120,12 +120,22 @@ mod tests {
                              "neighborhood": "Astoria", "borough": "queens"}));
         let g = groups_of(&f);
         let labels: Vec<String> = g.iter().map(label).collect();
-        assert_eq!(labels, vec!["Astoria · co-op · 4+bd", "Astoria · co-op", "Queens · co-op · 4+bd"]);
-        assert_eq!(g.iter().map(|g| g.level.thin()).collect::<Vec<_>>(), vec![false, false, true]);
+        assert_eq!(labels, vec!["Astoria · co-op · 4+bd"], "beds always match, no borough fallback");
+        assert!(!g[0].level.thin());
+        assert_eq!(g[0].key, "queens|Astoria|coop|4+");
+        let mut other = f.clone();
+        other.borough = Some("staten_island".into());
+        assert_ne!(groups_of(&other), g, "same area name in another borough: another group");
 
         let no_beds = facts(json!({"id": "a", "market": "nyc", "price": 1, "homeType": "condo",
                                    "neighborhood": "Astoria", "borough": "staten_island"}));
-        assert_eq!(groups_of(&no_beds).iter().map(label).collect::<Vec<_>>(), vec!["Astoria · condo"]);
+        assert!(groups_of(&no_beds).is_empty(), "no beds: no group");
+
+        for t in ["single_family", "multi_family", "townhouse", "other"] {
+            let house = facts(json!({"id": "a", "market": "nyc", "price": 1, "beds": 3, "homeType": t,
+                                     "neighborhood": "Astoria", "borough": "queens"}));
+            assert!(groups_of(&house).is_empty(), "{t}: NYC prices apartments only");
+        }
     }
 
     #[test]

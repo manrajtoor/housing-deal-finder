@@ -1,6 +1,6 @@
 //! housedeals-score: scores one market for the crawl job.
 //!
-//!     housedeals-score [--min-discount 15] [--min-comps-nyc 8] [--min-comps-mi 6]
+//!     housedeals-score [--min-discount 25] [--min-comps-nyc 8] [--min-comps-mi 6]
 //!                      [--max-price 900000] [--fresh-hours 72] < input.json > writes.json
 //!
 //! Reads `{"market", "now", "columns", "rows"}` (the pages of
@@ -16,8 +16,14 @@ use scorer::batch::{run, Settings};
 const USAGE: &str = "usage: housedeals-score [--min-discount PCT] [--min-comps-nyc N] [--min-comps-mi N] \
                      [--max-price USD] [--fresh-hours H] < input.json";
 
+/// The live alert threshold. Calibration on the first full crawl
+/// (DESIGN.md) put NYC's p95 discount near 25%: 15% under is about one
+/// standard deviation of same-size, same-building asking prices.
+const DEFAULT_MIN_DISCOUNT_PCT: f64 = 25.0;
+
 fn parse_args(args: &[String]) -> Result<Settings, String> {
     let mut s = Settings::default();
+    s.rule.min_discount_pct = DEFAULT_MIN_DISCOUNT_PCT;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         let (name, inline) = match flag.split_once('=') {
@@ -89,7 +95,9 @@ mod tests {
     fn flags_override_the_defaults() {
         let s = parse_args(&args(&["--min-discount", "12", "--min-comps-mi=5", "--max-price", "800000"])).unwrap();
         assert_eq!((s.rule.min_discount_pct, s.rule.min_comps_mi, s.rule.min_comps_nyc, s.rule.max_price), (12.0, 5, 8, 800_000.0));
-        assert_eq!(parse_args(&[]).unwrap(), Settings::default());
+        let mut live = Settings::default();
+        live.rule.min_discount_pct = 25.0;
+        assert_eq!(parse_args(&[]).unwrap(), live, "no flags: the live 25% threshold, library defaults otherwise");
         assert!(parse_args(&args(&["--max-price"])).is_err());
         assert!(parse_args(&args(&["--min-discount", "abc"])).is_err());
         assert!(parse_args(&args(&["--nope", "1"])).is_err());
