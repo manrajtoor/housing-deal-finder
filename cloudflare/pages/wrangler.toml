@@ -19,7 +19,6 @@ service = "housedeals-api"
 # /api/* verifies the Access login token against these, so a per-deployment
 # <hash>.pages.dev address that Access does not cover still serves no data.
 # The audience tag is on the app's Overview page ("Application Audience (AUD) Tag").
-# TODO: fill ACCESS_AUD after creating the Access app; until then /api/* answers 503.
 [vars]
 ACCESS_TEAM_DOMAIN = "https://divine-lab-4dde.cloudflareaccess.com"
-ACCESS_AUD = ""
+ACCESS_AUD = "f31e315f1553e666d77697944fb47517380beaf3eac88b00da5174ae25429cfc"
