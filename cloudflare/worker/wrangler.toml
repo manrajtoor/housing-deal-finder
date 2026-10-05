@@ -25,10 +25,10 @@ migrations_dir = "../d1/migrations"
 #   */30 * * * *  quick  newest page per search, then needs-detail
 #   0 11 * * *    full   every page, needs-detail; this cron also expires
 #                        active listings unseen for EXPIRE_AFTER_DAYS
-#   0 12 * * 0    sold   Michigan sold comps (Sundays)
+#   0 12 * * SUN    sold   Michigan sold comps (Sundays)
 # Cron times are UTC.
 [triggers]
-crons = ["*/30 * * * *", "0 11 * * *", "0 12 * * 0"]
+crons = ["*/30 * * * *", "0 11 * * *", "0 12 * * SUN"]
 
 [vars]
 GITHUB_REPO = "manrajtoor/housing-deal-finder"

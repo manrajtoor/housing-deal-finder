@@ -81,4 +81,4 @@ Listing fields shown on the dashboard (`id url address unit city neighborhood bo
 |---|---|
 | `*/30 * * * *` | `quick`: newest page per search, then needs-detail (≤ 15 detail pages). |
 | `0 11 * * *` | `full`: every page per search, then needs-detail (≤ 40). The Worker also expires active listings unseen for 3 days in this same cron. |
-| `0 12 * * 0` | `sold`: Michigan sold in the last 12 months. |
+| `0 12 * * SUN` | `sold`: Michigan sold in the last 12 months. |
