@@ -9,7 +9,12 @@ publish = false
 name = "scorer"
 path = "src/lib.rs"
 
-# Pure Rust, no wasm or Workers dependencies: the Worker links it, and
-# `cargo test` runs it natively.
+# The crawl job runs the scorer: `cargo build --release --bin housedeals-score`.
+[[bin]]
+name = "housedeals-score"
+path = "src/bin/housedeals-score.rs"
+
+# Pure Rust, no wasm or Workers dependencies (the Worker links it for its
+# date helpers), and `cargo test` runs it natively.
 [dependencies]
 serde_json = { version = "1", features = ["preserve_order"] }

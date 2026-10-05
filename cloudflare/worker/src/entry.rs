@@ -6,6 +6,8 @@
 //!   POST /api/listings                bearer INGEST_TOKEN
 //!   POST /api/listings/needs-detail   bearer
 //!   POST /api/listings/detail         bearer
+//!   GET  /api/score-input ?market=&after=&limit=   bearer
+//!   POST /api/scores                  bearer
 //!   GET  /api/deals    ?market=&maxPrice=&minDiscount=&limit=
 //!   GET  /api/alerts   ?market=&limit=
 //!   GET  /api/stats
@@ -15,11 +17,11 @@
 use serde_json::{json, Value};
 use worker::*;
 
-use crate::alerts::{rule_from_vars, AlertsQuery, NoNotifier};
+use crate::alerts::{rule_from_vars, NoNotifier};
 use crate::auth::{bearer_ok, read_allowed};
 use crate::d1::D1Store;
 use crate::dispatch::{self, DispatchConfig};
-use crate::scores::DealsQuery;
+use crate::scores::{AlertsQuery, DealsQuery, ScoreInputQuery};
 use crate::service::{self, ApiError, Config};
 
 /// Request bodies above this are refused before parsing (200 listings with
@@ -54,11 +56,23 @@ fn public_read_api(env: &Env) -> bool {
     var(env, "PUBLIC_READ_API").is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
 }
 
-fn json_response(status: u16, body: &Value) -> Result<Response> {
+fn json_headers() -> Result<Headers> {
     let headers = Headers::new();
     headers.set("Content-Type", "application/json; charset=utf-8")?;
     headers.set("Cache-Control", "no-store")?;
-    Ok(Response::from_json(body)?.with_status(status).with_headers(headers))
+    Ok(headers)
+}
+
+fn json_response(status: u16, body: &Value) -> Result<Response> {
+    Ok(Response::from_json(body)?.with_status(status).with_headers(json_headers()?))
+}
+
+/// A JSON body SQLite already built: sent as is, never parsed.
+fn text_reply(r: std::result::Result<String, ApiError>) -> Result<Response> {
+    match r {
+        Ok(body) => Ok(Response::ok(body)?.with_headers(json_headers()?)),
+        Err(e) => error_response(&e),
+    }
 }
 
 fn error_response(e: &ApiError) -> Result<Response> {
@@ -76,8 +90,8 @@ fn query_pairs(url: &Url) -> Vec<(String, String)> {
     url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect()
 }
 
-/// Bearer check, then the JSON body (size-capped).
-async fn authed_body(req: &mut Request, env: &Env) -> std::result::Result<Value, Result<Response>> {
+/// Bearer check only (GET routes).
+fn authed(req: &Request, env: &Env) -> std::result::Result<(), Result<Response>> {
     let token = env.secret("INGEST_TOKEN").map(|s| s.to_string()).unwrap_or_default();
     if token.is_empty() {
         return Err(error_response(&ApiError { status: 503, message: "ingest is disabled: INGEST_TOKEN is not set".into() }));
@@ -89,6 +103,18 @@ async fn authed_body(req: &mut Request, env: &Env) -> std::result::Result<Value,
             r
         }));
     }
+    Ok(())
+}
+
+/// Bearer check, then the JSON body parsed.
+async fn authed_body(req: &mut Request, env: &Env) -> std::result::Result<Value, Result<Response>> {
+    let text = authed_text(req, env).await?;
+    serde_json::from_str(&text).map_err(|e| error_response(&ApiError::bad_request(format!("body is not valid JSON: {e}"))))
+}
+
+/// Bearer check, then the body text (size-capped).
+async fn authed_text(req: &mut Request, env: &Env) -> std::result::Result<String, Result<Response>> {
+    authed(req, env)?;
     let len = req.headers().get("Content-Length").ok().flatten().and_then(|v| v.parse::<usize>().ok());
     if len.is_some_and(|n| n > MAX_BODY_BYTES) {
         return Err(error_response(&ApiError { status: 413, message: format!("body over {MAX_BODY_BYTES} bytes") }));
@@ -100,7 +126,7 @@ async fn authed_body(req: &mut Request, env: &Env) -> std::result::Result<Value,
     if text.len() > MAX_BODY_BYTES {
         return Err(error_response(&ApiError { status: 413, message: format!("body over {MAX_BODY_BYTES} bytes") }));
     }
-    serde_json::from_str(&text).map_err(|e| error_response(&ApiError::bad_request(format!("body is not valid JSON: {e}"))))
+    Ok(text)
 }
 
 fn reply<T: serde::Serialize>(r: std::result::Result<T, ApiError>) -> Result<Response> {
@@ -129,14 +155,11 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            let out = service::ingest(&store(&env)?, &NoNotifier, &config(&env), &body, &now_iso()).await;
+            let out = service::ingest(&store(&env)?, &body, &now_iso()).await;
             if let Ok(o) = &out {
-                if let Some(e) = &o.error {
-                    console_error!("ingest: {e}");
-                }
                 console_log!(
-                    "ingest: seen {} added {} updated {} unchanged {} scored {} alerts {} rows written {}",
-                    o.stats.seen, o.stats.added, o.stats.updated, o.stats.unchanged, o.scored, o.new_alerts, o.rows_written
+                    "ingest: seen {} added {} updated {} unchanged {} rows written {}",
+                    o.stats.seen, o.stats.added, o.stats.updated, o.stats.unchanged, o.rows_written
                 );
             }
             reply(out)
@@ -155,9 +178,28 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            let out = service::detail(&store(&env)?, &NoNotifier, &config(&env), &body, &now_iso()).await;
-            if let Ok(Some(e)) = out.as_ref().map(|o| &o.error) {
-                console_error!("detail: {e}");
+            reply(service::detail(&store(&env)?, &body, &now_iso()).await)
+        }
+
+        (Method::Get, "/api/score-input") => {
+            if let Err(r) = authed(&req, &env) {
+                return r;
+            }
+            let pairs = query_pairs(&url);
+            match ScoreInputQuery::from_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
+                Ok(q) => text_reply(service::score_input(&store(&env)?, &q, &now_iso()).await),
+                Err(m) => error_response(&ApiError::bad_request(m)),
+            }
+        }
+
+        (Method::Post, "/api/scores") => {
+            let text = match authed_text(&mut req, &env).await {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let out = service::post_scores(&store(&env)?, &NoNotifier, &text, &now_iso()).await;
+            if let Ok(o) = &out {
+                console_log!("scores: upserted {} deleted {} new alerts {}", o.upserted, o.deleted, o.new_alerts);
             }
             reply(out)
         }
@@ -165,7 +207,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         (Method::Get, "/api/deals") => {
             let pairs = query_pairs(&url);
             match DealsQuery::from_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
-                Ok(q) => reply(service::deals(&store(&env)?, &q, &now_iso()).await),
+                Ok(q) => text_reply(service::deals(&store(&env)?, &q, &now_iso()).await),
                 Err(m) => error_response(&ApiError::bad_request(m)),
             }
         }
@@ -173,15 +215,15 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         (Method::Get, "/api/alerts") => {
             let pairs = query_pairs(&url);
             match AlertsQuery::from_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
-                Ok(q) => reply(service::recent_alerts(&store(&env)?, &q, &now_iso()).await),
+                Ok(q) => text_reply(service::recent_alerts(&store(&env)?, &q, &now_iso()).await),
                 Err(m) => error_response(&ApiError::bad_request(m)),
             }
         }
 
-        (Method::Get, "/api/stats") => reply(service::stats(&store(&env)?, &now_iso()).await),
+        (Method::Get, "/api/stats") => text_reply(service::stats(&store(&env)?, &now_iso()).await),
 
-        (_, "/api/health" | "/api/listings" | "/api/listings/needs-detail" | "/api/listings/detail" | "/api/deals"
-        | "/api/alerts" | "/api/stats") => error_response(&ApiError { status: 405, message: "method not allowed".into() }),
+        (_, "/api/health" | "/api/listings" | "/api/listings/needs-detail" | "/api/listings/detail" | "/api/score-input"
+        | "/api/scores" | "/api/deals" | "/api/alerts" | "/api/stats") => error_response(&ApiError { status: 405, message: "method not allowed".into() }),
         _ => error_response(&ApiError { status: 404, message: "not found".into() }),
     }
 }
@@ -224,7 +266,7 @@ async fn expire_listings(env: &Env) {
         Err(e) => return console_error!("expiry: no D1 binding: {e}"),
     };
     match service::expire(&db, &now_iso(), &iso_days_ago(days)).await {
-        Ok(n) => console_log!("expiry: {n} listing(s) unseen for {days} days marked removed"),
+        Ok(n) => console_log!("expiry: {n} listing(s) unseen for {days} days marked removed, scores of removed listings dropped"),
         Err(e) => console_error!("expiry failed: {e}"),
     }
 }

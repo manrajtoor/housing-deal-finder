@@ -1,26 +1,26 @@
-//! Use cases, written against a two-method storage port ([`Store`]). `d1.rs`
+//! Use cases, written against a small storage port ([`Store`]). `d1.rs`
 //! implements it on Cloudflare D1; the tests implement it on an in-memory
 //! SQLite loaded with the real migrations, so the SQL itself is exercised.
 //! `entry.rs` only translates HTTP and cron events into these calls.
 //!
-//! D1 round trips per POST /api/listings: one id lookup, one write batch
-//! (listings + the crawl row), and only when something changed: one or two
-//! group loads and one score/alert batch.
+//! Nothing here scores (the crawl job does, see `scores.rs`). D1 round trips:
+//! - POST /api/listings: a prior-run check (quick crawls), one id lookup, one
+//!   write batch (listings, price history, the crawl row).
+//! - POST /api/listings/detail: one write batch.
+//! - POST /api/scores: one write batch.
+//! - GET /api/score-input, /api/deals, /api/alerts, /api/stats: one query
+//!   whose single text column is the response body.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashSet;
 
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use scorer::dates::date_minus_days;
-use scorer::{deal_json, AlertRule, Options, Scorer};
 
-use crate::alerts::{self, AlertsQuery, NewAlert, Notifier};
-use crate::ingest::{
-    detail_load_queries, detail_update, existing_from_row, existing_queries, prior_run_query, fresh_after_detail, listing_from_row,
-    merge_detail, parse_details, parse_payload, Planner, SaveStats, Scope,
-};
-use crate::scores::{self, borough_unit_of, needs_borough, unit_of, DealsQuery, Stored, Unit};
+use crate::alerts::Notifier;
+use crate::ingest::{detail_update, existing_from_row, existing_queries, parse_details, parse_payload, prior_run_query, Planner, SaveStats, Scope};
+use crate::scores::{self, AlertsQuery, DealsQuery, ScoreInputQuery, ScoresOutcome};
 use crate::sql::{Param, Stmt, Written};
 
 /// An error with the HTTP status it maps to.
@@ -44,6 +44,10 @@ impl ApiError {
 pub trait Store {
     /// Rows of one SELECT, as JSON objects keyed by column (numbers as doubles, like D1).
     async fn query(&self, s: &Stmt) -> Result<Vec<Value>, String>;
+    /// The text column `body` of the first row (`None` when there is no row
+    /// or it is NULL). Used for JSON that SQLite builds: one value crosses
+    /// from D1 to the Worker, whatever its size.
+    async fn body(&self, s: &Stmt) -> Result<Option<String>, String>;
     /// Runs the statements as one transaction; what each changed.
     async fn batch(&self, stmts: Vec<Stmt>) -> Result<Vec<Written>, String>;
 }
@@ -63,140 +67,8 @@ fn rows_written(w: &[Written]) -> u64 {
 /// Settings from the Worker vars.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Config {
-    pub rule: AlertRule,
-}
-
-impl Config {
-    fn options(&self) -> Options {
-        Options::with_rule(self.rule.clone())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Rescoring
-
-#[derive(Debug, Default)]
-pub struct Rescore {
-    /// Score writes and deletions.
-    pub stmts: Vec<Stmt>,
-    /// Fresh subjects the alert rule accepts.
-    pub alerts: Vec<NewAlert>,
-    /// Subjects priced.
-    pub scored: usize,
-    /// id -> (price, Deal) of every subject priced.
-    pub deals: HashMap<String, (i64, Value)>,
-}
-
-/// Scores the units of `changed` (contract-shaped listings already stored)
-/// and plans the writes. Subjects: every active listing of a neighbourhood
-/// or water-type unit, plus the changed listings themselves.
-pub async fn rescore<S: Store>(
-    store: &S,
-    cfg: &Config,
-    changed: &[Value],
-    fresh: &HashSet<String>,
-    now: &str,
-) -> Result<Rescore, String> {
-    let units: BTreeSet<Unit> = changed.iter().filter_map(unit_of).collect();
-    if units.is_empty() {
-        return Ok(Rescore::default());
-    }
-    let changed_ids: BTreeSet<String> = changed.iter().filter_map(|l| l["id"].as_str().map(str::to_string)).collect();
-    let sold_cutoff = date_minus_days(now, cfg.options().sold_comp_days).unwrap_or_default();
-    let units_v: Vec<Unit> = units.iter().cloned().collect();
-
-    let mut stored: HashMap<String, Stored> = HashMap::new();
-    let mut rows: Vec<Value> = Vec::new();
-    let mut have: HashSet<String> = HashSet::new();
-    let mut take = |raw: Vec<Value>, rows: &mut Vec<Value>, stored: &mut HashMap<String, Stored>| {
-        for r in raw {
-            let l = listing_from_row(&r);
-            let Some(id) = l["id"].as_str().map(str::to_string) else { continue };
-            if !have.insert(id.clone()) {
-                continue;
-            }
-            if let Some(s) = scores::stored_from_row(&r) {
-                stored.insert(id, s);
-            }
-            rows.push(l);
-        }
-    };
-    take(query_all(store, scores::group_queries(&units_v, &sold_cutoff)).await?, &mut rows, &mut stored);
-
-    let subject = |l: &Value| {
-        l["id"].as_str().is_some_and(|id| changed_ids.contains(id))
-            || unit_of(l).is_some_and(|u| units.contains(&u) && !matches!(u, Unit::NycBorough(..)))
-    };
-    let subjects: Vec<Value> = rows.iter().filter(|l| subject(l)).cloned().collect();
-    let scorer = Scorer::new(&rows, cfg.options(), now);
-    let mut scored = scores::score_all(&scorer, &subjects);
-
-    // NYC subjects that fell through to the borough group: load that group
-    // in full and score them again.
-    let more: BTreeSet<Unit> = scored
-        .iter()
-        .filter(|s| needs_borough(s))
-        .filter_map(|s| borough_unit_of(&s.listing))
-        .filter(|u| !units.contains(u))
-        .collect();
-    if !more.is_empty() {
-        let more_v: Vec<Unit> = more.into_iter().collect();
-        take(query_all(store, scores::group_queries(&more_v, &sold_cutoff)).await?, &mut rows, &mut stored);
-        let scorer = Scorer::new(&rows, cfg.options(), now);
-        for s in scored.iter_mut().filter(|s| needs_borough(s)) {
-            s.result = scorer.score(&s.listing);
-        }
-    }
-
-    let mut out = Rescore { stmts: scores::upsert_statements(&scored, &changed_ids, &stored, now), ..Default::default() };
-    for s in &scored {
-        let Ok(score) = &s.result else { continue };
-        out.scored += 1;
-        let price = s.listing["price"].as_f64().unwrap_or(0.0) as i64;
-        let deal = deal_json(&s.listing, score);
-        if score.alert && fresh.contains(s.id()) {
-            out.alerts.push(NewAlert {
-                listing_id: s.id().to_string(),
-                price,
-                market: s.listing["market"].as_str().unwrap_or_default().to_string(),
-                deal: deal.clone(),
-            });
-        }
-        out.deals.insert(s.id().to_string(), (price, deal));
-    }
-    Ok(out)
-}
-
-/// Runs the rescore writes plus `extra`, alert inserts first; returns the
-/// alerts that were new (INSERT OR IGNORE changed a row) and rows written.
-async fn save_rescore<S: Store>(
-    store: &S,
-    r: &Rescore,
-    extra: Vec<Stmt>,
-    now: &str,
-) -> Result<(Vec<NewAlert>, u64, usize), String> {
-    let n_alerts = r.alerts.len();
-    let mut stmts: Vec<Stmt> = r.alerts.iter().map(|a| alerts::insert_statement(a, now)).collect();
-    let score_writes = r.stmts.len();
-    stmts.extend(r.stmts.iter().cloned());
-    stmts.extend(extra);
-    if stmts.is_empty() {
-        return Ok((Vec::new(), 0, 0));
-    }
-    let w = store.batch(stmts).await?;
-    let new = r.alerts.iter().zip(&w[..n_alerts]).filter(|(_, w)| w.changes > 0).map(|(a, _)| a.clone()).collect();
-    Ok((new, rows_written(&w), score_writes))
-}
-
-async fn notify<S: Store>(store: &S, notifier: &impl Notifier, new: &[NewAlert], now: &str) -> Result<(), String> {
-    if new.is_empty() {
-        return Ok(());
-    }
-    let deals: Vec<Value> = new.iter().map(|a| a.deal.clone()).collect();
-    if notifier.notify(&deals).await? > 0 {
-        store.batch(new.iter().map(|a| alerts::notified_statement(a, now)).collect()).await?;
-    }
-    Ok(())
+    /// Only `max_price` is used here (NYC needs-detail); the crawl job applies the rule.
+    pub rule: scorer::AlertRule,
 }
 
 // ---------------------------------------------------------------------------
@@ -207,17 +79,13 @@ async fn notify<S: Store>(store: &S, notifier: &impl Notifier, new: &[NewAlert],
 pub struct IngestOutcome {
     #[serde(flatten)]
     pub stats: SaveStats,
+    /// Always 0: scoring and alerts run in the crawl job (kept for older crawlers).
     pub scored: usize,
     pub new_alerts: usize,
-    /// listing_scores rows written or deleted.
-    pub score_writes: usize,
     /// D1 rows written by this request (all tables and indexes).
     pub rows_written: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rejected: Vec<String>,
-    /// Scoring or alerting failed; the listings are stored either way.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// The run's row in `crawls`: one per (market, mode, seenAt), stats summed.
@@ -239,13 +107,7 @@ fn crawl_upsert(scope: &Scope, stats: &SaveStats) -> Option<Stmt> {
     ))
 }
 
-pub async fn ingest<S: Store>(
-    store: &S,
-    notifier: &impl Notifier,
-    cfg: &Config,
-    body: &Value,
-    now: &str,
-) -> Result<IngestOutcome, ApiError> {
+pub async fn ingest<S: Store>(store: &S, body: &Value, now: &str) -> Result<IngestOutcome, ApiError> {
     let payload = parse_payload(body, now).map_err(ApiError::bad_request)?;
     let mut ids: Vec<String> = payload.listings.iter().filter_map(|l| l["id"].as_str().map(str::to_string)).collect();
     ids.sort();
@@ -268,29 +130,7 @@ pub async fn ingest<S: Store>(
         ..Default::default()
     };
     if !stmts.is_empty() {
-        out.rows_written += rows_written(&store.batch(stmts).await.map_err(ApiError::internal)?);
-    }
-    if planner.changed.is_empty() {
-        return Ok(out);
-    }
-    // The last copy of each changed listing, as stored.
-    let mut last: HashMap<&str, &Value> = HashMap::new();
-    for l in &payload.listings {
-        last.insert(l["id"].as_str().unwrap_or_default(), l);
-    }
-    let changed: Vec<Value> = planner.changed.iter().filter_map(|id| last.get(id.as_str()).map(|l| (*l).clone())).collect();
-    let result = async {
-        let r = rescore(store, cfg, &changed, &planner.fresh, now).await?;
-        let (new, written, score_writes) = save_rescore(store, &r, Vec::new(), now).await?;
-        out.scored = r.scored;
-        out.new_alerts = new.len();
-        out.score_writes = score_writes;
-        out.rows_written += written;
-        notify(store, notifier, &new, now).await
-    }
-    .await;
-    if let Err(e) = result {
-        out.error = Some(format!("scoring or alerts failed (listings are stored): {e}"));
+        out.rows_written = rows_written(&store.batch(stmts).await.map_err(ApiError::internal)?);
     }
     Ok(out)
 }
@@ -302,86 +142,86 @@ pub async fn ingest<S: Store>(
 #[serde(rename_all = "camelCase")]
 pub struct DetailOutcome {
     pub updated: usize,
+    /// Always 0 (scoring runs in the crawl job; kept for older crawlers).
     pub scored: usize,
     pub new_alerts: usize,
     /// Ids not in the store.
     pub unknown: usize,
     pub rows_written: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
-pub async fn detail<S: Store>(
-    store: &S,
-    notifier: &impl Notifier,
-    cfg: &Config,
-    body: &Value,
-    now: &str,
-) -> Result<DetailOutcome, ApiError> {
+/// Stores detail fields: one UPDATE per result, nothing read. An id the
+/// store does not know changes no row and is counted as unknown.
+pub async fn detail<S: Store>(store: &S, body: &Value, now: &str) -> Result<DetailOutcome, ApiError> {
     let details = parse_details(body, now).map_err(ApiError::bad_request)?;
-    let mut ids: Vec<String> = details.iter().map(|d| d.id.clone()).collect();
-    ids.sort();
-    ids.dedup();
-    let rows = query_all(store, detail_load_queries(&ids)).await.map_err(ApiError::internal)?;
-    let stored: HashMap<String, Value> = rows
-        .iter()
-        .map(listing_from_row)
-        .filter_map(|l| Some((l["id"].as_str()?.to_string(), l)))
-        .collect();
     let mut out = DetailOutcome::default();
-    let mut stmts = Vec::new();
-    let mut merged: HashMap<String, Value> = HashMap::new();
-    // The stored versions too: a new water type moves a listing to another
-    // group, and the group it left must be rescored without it.
-    let mut before: Vec<Value> = Vec::new();
-    for d in &details {
-        let Some(base) = merged.get(&d.id).or_else(|| stored.get(&d.id)).cloned() else {
-            out.unknown += 1;
-            continue;
-        };
-        stmts.push(detail_update(d));
-        if !merged.contains_key(&d.id) {
-            before.push(base.clone());
-        }
-        merged.insert(d.id.clone(), merge_detail(&base, d));
-    }
-    out.updated = merged.len();
-    if stmts.is_empty() {
+    if details.is_empty() {
         return Ok(out);
     }
-    out.rows_written += rows_written(&store.batch(stmts).await.map_err(ApiError::internal)?);
-
-    let changed: Vec<Value> = merged.into_values().collect();
-    // Sold rows are comps: rescoring their groups never makes them fresh
-    // (fresh_after_detail requires an active listing) and the scorer refuses
-    // them as subjects, so they never alert.
-    let mut touched = changed.clone();
-    touched.extend(before.into_iter().filter(|b| {
-        let unit = unit_of(b);
-        unit.is_some() && changed.iter().all(|c| c["id"] != b["id"] || unit_of(c) != unit)
-    }));
-    let fresh: HashSet<String> = changed
-        .iter()
-        .filter(|l| fresh_after_detail(l, now))
-        .filter_map(|l| l["id"].as_str().map(str::to_string))
-        .collect();
-    let result = async {
-        let r = rescore(store, cfg, &touched, &fresh, now).await?;
-        // Alerts already stored for these listings show the new detail fields.
-        let patches: Vec<Stmt> = changed
-            .iter()
-            .filter_map(|l| r.deals.get(l["id"].as_str()?))
-            .map(|(price, deal)| alerts::patch_statement(deal["id"].as_str().unwrap_or_default(), *price, deal))
-            .collect();
-        let (new, written, _) = save_rescore(store, &r, patches, now).await?;
-        out.scored = r.scored;
-        out.new_alerts = new.len();
-        out.rows_written += written;
-        notify(store, notifier, &new, now).await
+    let w = store.batch(details.iter().map(detail_update).collect()).await.map_err(ApiError::internal)?;
+    let mut updated = HashSet::new();
+    let mut unknown = HashSet::new();
+    for (d, w) in details.iter().zip(&w) {
+        if w.changes > 0 {
+            updated.insert(d.id.as_str());
+        } else {
+            unknown.insert(d.id.as_str());
+        }
     }
-    .await;
-    if let Err(e) = result {
-        out.error = Some(format!("scoring or alerts failed (details are stored): {e}"));
+    out.updated = updated.len();
+    out.unknown = unknown.difference(&updated).count();
+    out.rows_written = rows_written(&w);
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Scoring, done by the crawl job
+
+/// `GET /api/score-input`: the response body exactly as SQLite built it.
+pub async fn score_input<S: Store>(store: &S, q: &ScoreInputQuery, now: &str) -> Result<String, ApiError> {
+    let cutoff = date_minus_days(now, scores::SOLD_COMP_DAYS).unwrap_or_default();
+    let body = store.body(&scores::score_input_query(q, &cutoff)).await.map_err(ApiError::internal)?;
+    body.ok_or_else(|| ApiError::internal("score input: no row"))
+}
+
+/// `POST /api/scores`: alerts (insert, then refresh a stored alert's Deal),
+/// score upserts and deletions in one batch. `text` is the raw body.
+pub async fn post_scores<S: Store>(store: &S, notifier: &impl Notifier, text: &str, now: &str) -> Result<ScoresOutcome, ApiError> {
+    let plan = scores::parse_scores(text, now).map_err(ApiError::bad_request)?;
+    let mut out = ScoresOutcome::default();
+    if plan.stmts.is_empty() {
+        return Ok(out);
+    }
+    let w = store.batch(plan.stmts.clone()).await.map_err(ApiError::internal)?;
+    let n_alert_stmts = plan.alerts * 2;
+    let mut new_alerts = Vec::new();
+    for (i, w) in w[..n_alert_stmts].iter().enumerate() {
+        if i % 2 == 0 && w.changes > 0 {
+            out.new_alerts += 1;
+            new_alerts.push(&plan.stmts[i]);
+        } else if i % 2 == 1 {
+            out.patched_alerts += w.changes;
+        }
+    }
+    out.upserted = w[n_alert_stmts..n_alert_stmts + plan.upserts].iter().map(|w| w.changes).sum();
+    out.deleted = w[n_alert_stmts + plan.upserts..].iter().map(|w| w.changes).sum();
+    out.rows_written = rows_written(&w);
+    if !new_alerts.is_empty() {
+        // Parsed only here, for the few new alerts: (id, price, deal) are params 1, 3, 5.
+        let deals: Vec<Value> =
+            new_alerts.iter().filter_map(|s| s.params[4].as_str().and_then(|d| serde_json::from_str(d).ok())).collect();
+        if notifier.notify(&deals).await.map_err(ApiError::internal)? > 0 {
+            let marks = new_alerts
+                .iter()
+                .map(|s| {
+                    Stmt::new(
+                        "UPDATE deal_alerts SET notified_at = ?1 WHERE listing_id = ?2 AND price = ?3",
+                        vec![Param::Text(now.into()), s.params[0].clone(), s.params[2].clone()],
+                    )
+                })
+                .collect();
+            store.batch(marks).await.map_err(ApiError::internal)?;
+        }
     }
     Ok(out)
 }
@@ -398,7 +238,7 @@ pub async fn needs_detail<S: Store>(store: &S, cfg: &Config, body: &Value, now: 
         .await
         .map_err(ApiError::internal)?;
     if market == "mi" && rows.len() < limit {
-        let cutoff = date_minus_days(now, cfg.options().sold_comp_days).unwrap_or_default();
+        let cutoff = date_minus_days(now, scores::SOLD_COMP_DAYS).unwrap_or_default();
         let sold = store
             .query(&scores::needs_detail_sold_query(limit - rows.len(), &cutoff))
             .await
@@ -409,24 +249,23 @@ pub async fn needs_detail<S: Store>(store: &S, cfg: &Config, body: &Value, now: 
     Ok(json!({ "ids": col("id"), "urls": col("url") }))
 }
 
-pub async fn deals<S: Store>(store: &S, q: &DealsQuery, now: &str) -> Result<Value, ApiError> {
-    let rows = store.query(&scores::deals_query(q)).await.map_err(ApiError::internal)?;
-    Ok(json!({ "generatedAt": now, "deals": scores::parse_deal_rows(&rows, &[]) }))
+async fn body_of<S: Store>(store: &S, s: Stmt) -> Result<String, ApiError> {
+    store.body(&s).await.map_err(ApiError::internal)?.ok_or_else(|| ApiError::internal("no row"))
 }
 
-pub async fn recent_alerts<S: Store>(store: &S, q: &AlertsQuery, now: &str) -> Result<Value, ApiError> {
-    let rows = store.query(&alerts::list_query(q)).await.map_err(ApiError::internal)?;
-    Ok(json!({ "generatedAt": now, "alerts": scores::parse_deal_rows(&rows, &[("created_at", "createdAt")]) }))
+/// `{"generatedAt", "deals": [...]}` as SQLite built it.
+pub async fn deals<S: Store>(store: &S, q: &DealsQuery, now: &str) -> Result<String, ApiError> {
+    body_of(store, scores::deals_query(q, now)).await
 }
 
-pub async fn stats<S: Store>(store: &S, now: &str) -> Result<Value, ApiError> {
-    let q = |sql: &'static str| Stmt::new(sql, vec![]);
-    let e = ApiError::internal;
-    let counts = store.query(&q(scores::COUNTS_SQL)).await.map_err(e)?;
-    let crawls = store.query(&q(scores::CRAWLS_SQL)).await.map_err(e)?;
-    let alerts = store.query(&q(scores::ALERT_COUNTS_SQL)).await.map_err(e)?;
-    let scored = store.query(&q(scores::SCORED_COUNTS_SQL)).await.map_err(e)?;
-    Ok(scores::stats_json(now, &counts, &crawls, &alerts, &scored))
+/// `{"generatedAt", "alerts": [...]}` as SQLite built it.
+pub async fn recent_alerts<S: Store>(store: &S, q: &AlertsQuery, now: &str) -> Result<String, ApiError> {
+    body_of(store, scores::alerts_query(q, now)).await
+}
+
+/// `{"generatedAt", "counts", "crawls", "alerts", "scored"}` as SQLite built it.
+pub async fn stats<S: Store>(store: &S, now: &str) -> Result<String, ApiError> {
+    body_of(store, scores::stats_query(now)).await
 }
 
 /// Hours a market's last full sweep may be old for its listings to expire.
@@ -434,7 +273,8 @@ pub const FULL_SWEEP_MAX_AGE_HOURS: i64 = 36;
 /// `crawls` rows older than this are pruned by the daily cron.
 pub const KEEP_CRAWLS_DAYS: i64 = 90;
 
-/// Daily cron: retire active listings unseen since `cutoff`; returns how many.
+/// Daily cron: retire active listings unseen since `cutoff`, drop the scores
+/// of removed listings; returns how many listings were retired.
 pub async fn expire<S: Store>(store: &S, now: &str, cutoff: &str) -> Result<u64, String> {
     let full_since = scorer::dates::iso_minus_hours(now, FULL_SWEEP_MAX_AGE_HOURS).unwrap_or_default();
     let keep = scorer::dates::iso_minus_hours(now, KEEP_CRAWLS_DAYS * 24).unwrap_or_default();

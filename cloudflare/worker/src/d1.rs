@@ -41,6 +41,10 @@ impl Store for D1Store {
         self.prepare(s)?.all().await.map_err(err)?.results::<Value>().map_err(err)
     }
 
+    async fn body(&self, s: &Stmt) -> Result<Option<String>, String> {
+        self.prepare(s)?.first::<String>(Some("body")).await.map_err(err)
+    }
+
     async fn batch(&self, stmts: Vec<Stmt>) -> Result<Vec<Written>, String> {
         if stmts.is_empty() {
             return Ok(Vec::new());

@@ -13,7 +13,7 @@ import (
 	"housedeals/crawler/internal/zillow"
 )
 
-func init() { throttleDelay = 0 }
+func init() { throttleDelay, detailDelay = 0, 0 }
 
 func noEnv(string) string { return "" }
 
@@ -28,10 +28,21 @@ func TestFlagErrors(t *testing.T) {
 		{[]string{"--mode", "quick"}, "pass --push URL or --dry-run"},
 		{[]string{"--mode", "quick", "--push", "https://api.example"}, "HOUSEDEALS_INGEST_TOKEN"},
 		{[]string{"--mode", "quick", "--dry-run", "extra"}, "unexpected arguments"},
+		{[]string{"--mode", "quick", "--push", "https://api.example", "--scorer", "/no/such/housedeals-score"}, "pass --no-score"},
 	}
-	for _, c := range cases {
+	token := func(k string) string {
+		if k == "HOUSEDEALS_INGEST_TOKEN" {
+			return "t"
+		}
+		return ""
+	}
+	for i, c := range cases {
 		var stderr bytes.Buffer
-		code := run(context.Background(), c.args, noEnv, &bytes.Buffer{}, &stderr, fetch.Pages{})
+		env := noEnv
+		if i == len(cases)-1 {
+			env = token
+		}
+		code := run(context.Background(), c.args, env, &bytes.Buffer{}, &stderr, fetch.Pages{})
 		if code != 2 || !strings.Contains(stderr.String(), c.want) {
 			t.Errorf("%v: code %d, stderr %q, want %q", c.args, code, stderr.String(), c.want)
 		}

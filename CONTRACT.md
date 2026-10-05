@@ -45,19 +45,38 @@ All money is whole US dollars, all times ISO-8601 UTC strings.
 Crawler routes need `Authorization: Bearer <INGEST_TOKEN>`.
 
 - `POST /api/listings` body `{"listings":[Listing…], "scope":{"source","market","mode":"quick|full|sold","seenAt"}}`
-  (≤ 200 listings a request; the crawler sends 25). Returns
-  `{"seen","added","updated","unchanged","priceDrops","priceRises","relisted","scored","newAlerts"}`.
+  (≤ 200 listings a request; the crawler sends 25). Stores only: no scoring,
+  no alerts. Returns
+  `{"seen","added","updated","unchanged","priceDrops","priceRises","relisted","scored","newAlerts","rowsWritten"}`
+  (`scored` and `newAlerts` are always 0, kept for older crawlers).
 - `POST /api/listings/needs-detail` body `{"market":"mi"|"nyc","limit":N}` → `{"ids":[…], "urls":[…]}`:
   - Michigan: active listings whose `detailReadAt` is null.
-  - NYC: active listings ≤ $900k scoring ≥ 10% under baseline whose `detailReadAt` is null.
-- `POST /api/listings/detail` body `{"listings":[{id, detailReadAt, description?, waterType?, waterBody?, frontageFt?, maintenance?, taxes?, yearBuilt?}]}` → `{"updated":N,"scored":N,"newAlerts":N}`.
+  - NYC: active listings ≤ $900k whose stored score (written by the crawl job) is ≥ 10% under baseline and whose `detailReadAt` is null.
+- `POST /api/listings/detail` body `{"listings":[{id, detailReadAt, description?, waterType?, waterBody?, frontageFt?, maintenance?, taxes?, yearBuilt?}]}` → `{"updated","unknown","scored":0,"newAlerts":0,"rowsWritten"}`. Stores only.
+- `GET /api/score-input?market=nyc|mi&after=<id>&limit=<≤1000>` → `{"market","columns":[…],"rows":[[…]…],"last","n"}`:
+  one page, by id, of the market's active unremoved listings and homes sold in the last 365 days.
+  Each row is an array in `columns` order: the Deal's listing fields, `status soldAt removedAt compOnly freshAt detailReadAt`,
+  and the stored score `storedDiscount storedAlert storedPrice scoredAt` (null when none). The next page asks `after=<last>`;
+  a page with `n` < `limit` is the last. SQLite builds the whole body.
+- `POST /api/scores` body `{"market","upserts":[{"id","price","discountPct","alert","deal":Deal}],"deletes":["id"…],"alerts":[{"id","price","deal":Deal}]}`
+  (≤ 100 items; the crawler sends ≤ 50, counting an alert twice) → `{"upserted","deleted","newAlerts","patchedAlerts","rowsWritten"}`.
+  Upserts and alerts apply only to active unremoved listings of the market. Alerts are `INSERT OR IGNORE` keyed by
+  (id, price); a repeated alert refreshes the stored Deal (`patchedAlerts`), so detail fields read later show up.
 
 Read routes (only from the Pages service binding, host `housedeals-api.internal`, unless `PUBLIC_READ_API=true`):
 
 - `GET /api/health`: open.
 - `GET /api/deals?market=nyc|mi&maxPrice=&minDiscount=&limit=` → `{"deals":[Deal…]}`, best discount first.
 - `GET /api/alerts?market=&limit=` → `{"alerts":[Deal & {createdAt}…]}`, newest first.
-- `GET /api/stats` → `{"counts":[{"market","status","n"}…], "crawls":[{"market","mode","at"}…]}` (last crawl per market and mode).
+- `GET /api/stats` → `{"generatedAt","counts":[{"market","status","n"}…], "crawls":[{"market","mode","at"}…], "alerts":[{"market","n"}…], "scored":[{"market","n"}…]}` (last crawl per market and mode).
+
+Read bodies are built by SQLite from the stored Deal JSON and passed through.
+
+## Scorer CLI (`housedeals-score`, scorer/)
+
+Reads `{"market","now","columns","rows"}` (the score-input pages joined) on stdin and writes
+`{"market","upserts","deletes","alerts","stats"}` on stdout. Flags: `--min-discount 15 --min-comps-nyc 8
+--min-comps-mi 6 --max-price 900000 --fresh-hours 72`. No network.
 
 ## Deal (scorer output, stored in `listing_scores.deal` as JSON)
 
@@ -79,6 +98,6 @@ Listing fields shown on the dashboard (`id url address unit city neighborhood bo
 
 | Cron | Input `mode` |
 |---|---|
-| `*/30 * * * *` | `quick`: newest page per search, then needs-detail (≤ 15 detail pages). |
-| `0 11 * * *` | `full`: every page per search, then needs-detail (≤ 40). The Worker also expires active listings unseen for 3 days in this same cron. |
-| `0 12 * * SUN` | `sold`: Michigan sold in the last 12 months. |
+| `*/30 * * * *` | `quick`: newest page per search, then needs-detail (≤ 6 detail pages per market), then scoring. |
+| `0 11 * * *` | `full`: every page per search, then needs-detail (≤ 20), then scoring. The Worker also expires active listings unseen for 3 days in this same cron and deletes the scores of removed listings. |
+| `0 12 * * SUN` | `sold`: Michigan sold in the last 12 months, then Michigan scoring. |

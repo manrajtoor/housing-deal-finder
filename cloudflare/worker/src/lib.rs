@@ -4,14 +4,18 @@
 //! - [`sql`]      database-neutral statements (`Stmt`, `Param`)
 //! - [`auth`]     bearer-token check, where reads are served
 //! - [`ingest`]   validation and the upsert planner (listings, detail pages)
-//! - [`scores`]   units to rescore, group loads, stored scores, deals/needs-detail/expiry/stats SQL
-//! - [`alerts`]   alert statements, the `Notifier` seam
+//! - [`scores`]   score input for the crawl job, its score/alert writes, and
+//!                the deals/alerts/stats/needs-detail/expiry SQL
+//! - [`alerts`]   the alert rule from the vars, the `Notifier` seam
 //! - [`dispatch`] starting the GitHub Actions crawl from the crons
 //! - [`service`]  use cases over the `Store` port
 //! - `d1`         D1 implementation of `Store` (wasm only)
 //! - `entry`      fetch + scheduled handlers, the composition root (wasm only)
 //!
 //! Everything except `d1` and `entry` is plain Rust, so `cargo test` runs it natively.
+//!
+//! The Worker never scores: the crawl job runs `housedeals-score` (scorer/)
+//! over `GET /api/score-input` and posts the result to `POST /api/scores`.
 
 pub mod alerts;
 pub mod auth;

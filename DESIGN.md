@@ -8,8 +8,17 @@ Finds homes asking well under what comparable homes ask. Two markets:
   Charlevoix, Emmet (the "Petoskey" area), alert at ≤ $900k.
 
 Same shape as `used-car-deal-finder`: a Go crawler in GitHub Actions pushes
-batches to a Rust Worker, which stores them in D1, scores only the groups a
-batch touched, and serves a Pages dashboard behind Cloudflare Access.
+batches to a Rust Worker, which stores them in D1 and serves a Pages
+dashboard behind Cloudflare Access.
+
+Scoring runs in the crawl job, not the Worker. Rescoring comp groups inside
+each push cost 13-56 ms of Worker CPU (wasm, plus turning every D1 row into
+Rust values) against the Free plan's 10 ms, and a full crawl hit Error 1102.
+So after its searches and detail reads, the job reads each crawled market's
+rows back (`GET /api/score-input`, JSON built by SQLite), runs the Rust
+scorer as a native binary (`housedeals-score`, a few ms) and posts only the
+scores that changed, plus alerts (`POST /api/scores`). The Worker's routes
+just bind values and pass JSON strings through.
 
 ## Sources (probed from GitHub Actions, 2026-10-05)
 
@@ -24,8 +33,12 @@ Craigslist (thin and noisy) and NYC DOF sold prices (no sq ft or beds for
 units) are possible later additions, not part of v1.
 
 Zillow Group's terms forbid automated access. The owner accepted that: crawls
-stay small (1.5 s between requests, one process), are for personal use only,
-and nothing is republished; the dashboard sits behind Access.
+stay small (1.5 s between requests, 6 s between detail pages, one process),
+are for personal use only, and nothing is republished; the dashboard sits
+behind Access. Zillow answered 403 after 14 detail pages 1.5 s apart, so a
+run reads at most 6 (quick) or 20 (full) detail pages per market, and a
+blocked detail page ends that market's detail reads for the run with a
+warning, not a failed run.
 
 ## Comps go above the alert ceiling
 
@@ -62,22 +75,37 @@ use their sale price, which tends to sit a little under asking, so the
 baseline is conservative and alerts lean toward fewer false positives.
 
 **Alert rule:** ≥ 15% under baseline, ≥ 6 comps (Michigan) or ≥ 8 (NYC), not
-thin, price ≤ $900k, discount ≤ 50% (bigger means bad data), not `access`.
+thin, price ≤ $900k, discount ≤ 50% (bigger means bad data), and in
+Michigan only read `great_lakes` or `inland` frontage (unread, `other` and
+`access` listings are scored but never alert).
 The Zestimate is shown next to the alert as a second opinion, never used in
-the score.
+the score. The rule's numbers are `housedeals-score` flags with these
+defaults. A listing alerts only while fresh: the Worker records `fresh_at`
+when a listing is new and young in a quick crawl (not a market's first run),
+relisted or cheaper, and the scorer alerts on it for 72 hours from then.
+
+**Stored scores.** The scorer scores every active listing of the market
+against all of its rows and rewrites a stored score only when it is missing,
+its discount moved by 0.5 point or more, its alert flag flipped, the price
+changed, or the detail page was read after it was scored. Scores that no
+longer price are deleted; the daily expiry deletes those of removed
+listings.
 
 ## Schedule (Worker cron → `workflow_dispatch`)
 
-- Every 30 min: newest page of each search (NYC and Michigan), new detail pages.
-- Daily 11:00 UTC: full sweep of every page (keeps `last_seen` honest), plus
-  expiry of listings unseen for 3 days.
-- Weekly: Michigan sold comps.
+- Every 30 min: newest page of each search (NYC and Michigan), up to 6 new
+  detail pages per market, then scoring.
+- Daily 11:00 UTC: full sweep of every page (keeps `last_seen` honest), up to
+  20 detail pages per market, scoring, plus expiry of listings unseen for
+  3 days.
+- Weekly: Michigan sold comps, then Michigan scoring.
 
 ## D1 budget
 
 ~6 000 NYC + ~500 Michigan rows. Unchanged rows are not rewritten; `last_seen`
 is refreshed only every 20 h, so a daily sweep touches each row about once a
-day (~6 500 writes) plus price changes and new listings.
+day (~6 500 writes) plus price changes and new listings. Score writes are
+limited the same way: unchanged scores are not rewritten.
 
 ## Names (personal Cloudflare account 7377038a…)
 

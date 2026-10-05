@@ -212,3 +212,52 @@ func TestNew(t *testing.T) {
 		}
 	}
 }
+
+func TestScoreInputAndPostScores(t *testing.T) {
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		got = append(got, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery+" "+r.Header.Get("Authorization")+" "+string(raw))
+		switch r.URL.Path {
+		case ScoreInputPath:
+			if r.URL.Query().Get("after") == "" {
+				fmt.Fprint(w, `{"market":"mi","columns":["id"],"rows":[["zl:1"],["zl:2"]],"last":"zl:2","n":2}`)
+			} else {
+				fmt.Fprint(w, `{"market":"mi","columns":["id"],"rows":[],"last":null,"n":0}`)
+			}
+		case ScoresPath:
+			fmt.Fprint(w, `{"upserted":1,"deleted":0,"newAlerts":1,"patchedAlerts":0,"rowsWritten":3}`)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+	c, err := New(srv.URL, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := c.ScoreInput(context.Background(), "mi", "", 1000)
+	if err != nil || p.N != 2 || len(p.Rows) != 2 || *p.Last != "zl:2" || string(p.Columns) != `["id"]` {
+		t.Fatalf("page %+v err %v", p, err)
+	}
+	p, err = c.ScoreInput(context.Background(), "mi", "zl:2", 1000)
+	if err != nil || p.Last != nil || p.N != 0 {
+		t.Fatalf("page %+v err %v", p, err)
+	}
+	s, err := c.PostScores(context.Background(), Scores{Market: "mi", Alerts: []json.RawMessage{json.RawMessage(`{"id":"zl:1"}`)}})
+	if err != nil || s.Upserted != 1 || s.NewAlerts != 1 {
+		t.Fatalf("stats %+v err %v", s, err)
+	}
+	want := []string{
+		"GET /api/score-input?after=&limit=1000&market=mi Bearer secret ",
+		"GET /api/score-input?after=zl%3A2&limit=1000&market=mi Bearer secret ",
+		`POST /api/scores? Bearer secret {"market":"mi","upserts":[],"deletes":[],"alerts":[{"id":"zl:1"}]}`,
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("requests\n %q\nwant\n %q", got, want)
+	}
+	big := Scores{Market: "mi", Deletes: make([]json.RawMessage, MaxScoreItems+1)}
+	if _, err := c.PostScores(context.Background(), big); err == nil {
+		t.Error("over MaxScoreItems must be refused before sending")
+	}
+}

@@ -3,14 +3,21 @@
 //
 //	housedeals --mode quick|full|sold [--market nyc|mi|all] [--push URL]
 //	           [--dry-run] [--max-pages N] [--detail-limit N] [--delay 1.5s]
+//	           [--scorer PATH | --no-score]
 //
 // The ingest token comes from HOUSEDEALS_INGEST_TOKEN. --dry-run prints the
 // listings (and any detail reads) as JSON on stdout and pushes nothing.
-// Logs go to stderr, one line per search. The exit status is 1 when a
-// source, a push or a detail read failed (what was gathered is still pushed).
+// After pushing, each market crawled is scored: its rows are read back from
+// the Worker (GET /api/score-input), run through the housedeals-score
+// binary (scorer/) and the scores posted (POST /api/scores).
+// Logs go to stderr, one line per search, detail step and market scored.
+// The exit status is 1 when a source, a push, a detail read or the scoring
+// failed (what was gathered is still pushed); a detail page that is blocked
+// only stops the detail reads, with a warning.
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -18,7 +25,9 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,6 +40,10 @@ import (
 // throttleDelay spaces every request of a run (tests shorten it).
 var throttleDelay = fetch.DefaultDelay
 
+// detailDelay also spaces detail pages: Zillow answered 403 after 14 detail
+// pages 1.5 s apart (tests shorten it).
+var detailDelay = 6 * time.Second
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -38,10 +51,10 @@ func main() {
 }
 
 type options struct {
-	mode, market, push    string
-	dryRun                bool
-	maxPages, detailLimit int
-	delay                 time.Duration
+	mode, market, push, scorer string
+	dryRun, noScore            bool
+	maxPages, detailLimit      int
+	delay                      time.Duration
 }
 
 func parseFlags(args []string, stderr io.Writer) (options, error) {
@@ -53,8 +66,10 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&o.push, "push", "", "Worker base URL to push to (token from "+apistore.TokenEnv+")")
 	fs.BoolVar(&o.dryRun, "dry-run", false, "print JSON to stdout, push nothing")
 	fs.IntVar(&o.maxPages, "max-pages", 0, "pages per search (default: quick 1, full 60, sold 20)")
-	fs.IntVar(&o.detailLimit, "detail-limit", -1, "detail pages per market (default: quick 15, full 40, sold 0)")
+	fs.IntVar(&o.detailLimit, "detail-limit", -1, "detail pages per market (default: quick 6, full 20, sold 0)")
 	fs.DurationVar(&o.delay, "delay", 0, "spacing between requests (default and minimum 1.5s)")
+	fs.StringVar(&o.scorer, "scorer", "housedeals-score", "path of the scorer binary (scorer/, cargo build --release)")
+	fs.BoolVar(&o.noScore, "no-score", false, "push listings and details but do not score")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -100,6 +115,15 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		}
 		api = c
 	}
+	var scorer crawl.Scorer
+	if api != nil && !o.dryRun && !o.noScore {
+		path, err := exec.LookPath(o.scorer)
+		if err != nil {
+			fmt.Fprintf(stderr, "housedeals: scorer %q not found (build scorer/ or pass --no-score): %v\n", o.scorer, err)
+			return 2
+		}
+		scorer = execScorer{path: path}
+	}
 	markets := []string{listing.MarketNYC, listing.MarketMI}
 	if o.market != "all" {
 		markets = []string{o.market}
@@ -112,11 +136,26 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 
 	res := crawl.Run(ctx, crawl.Config{
 		Mode: o.mode, Markets: markets, MaxPages: o.maxPages, DetailLimit: o.detailLimit,
-		DryRun: o.dryRun, Fetcher: fetcher, API: api, Out: stdout, Log: logger,
+		DryRun: o.dryRun, Fetcher: fetcher, API: api, Scorer: scorer, DetailDelay: detailDelay,
+		Out: stdout, Log: logger,
 	})
 	logger.Printf("done: %d listings, %d detail reads, %d failures", len(res.Listings), len(res.Details), len(res.Failures))
 	if len(res.Failures) > 0 {
 		return 1
 	}
 	return 0
+}
+
+// execScorer runs the housedeals-score binary: input on stdin, writes on stdout.
+type execScorer struct{ path string }
+
+func (e execScorer) Score(ctx context.Context, input []byte) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, e.path)
+	cmd.Stdin = bytes.NewReader(input)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%s: %v: %s", e.path, err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
 }

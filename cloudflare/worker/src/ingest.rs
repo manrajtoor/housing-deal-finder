@@ -16,7 +16,10 @@
 //!   exists (so a market's very first run never alerts); `full` and `sold`
 //!   crawls never make a new listing fresh; or
 //! - relisted, or cheaper than before (any mode).
-//! A first load therefore stores and scores listings without alerting on them.
+//! A first load therefore stores listings without alerting on them.
+//!
+//! Nothing here scores: `fresh_at` is recorded, and the crawl job
+//! (`housedeals-score`) alerts on listings whose `fresh_at` is under 72 h old.
 
 use std::collections::{HashMap, HashSet};
 
@@ -34,9 +37,6 @@ pub const MAX_LISTINGS_PER_REQUEST: usize = 200;
 pub const TOUCH_EVERY_HOURS: i64 = 20;
 /// New listings this young (days on market) are fresh.
 pub const FRESH_MAX_DAYS_ON_MARKET: f64 = 3.0;
-/// A detail page read within this many hours of a listing becoming fresh
-/// keeps it alert-eligible (Michigan water type arrives with the detail page).
-pub const FRESH_WINDOW_HOURS: i64 = 72;
 pub const MAX_DESCRIPTION_CHARS: usize = 3000;
 const MAX_TEXT_CHARS: usize = 500;
 const MAX_URL_CHARS: usize = 1000;
@@ -249,28 +249,6 @@ fn param(l: &Value, k: &str, kind: Kind) -> Param {
     }
 }
 
-/// A stored row (snake_case, D1 numbers as doubles) back in contract shape.
-/// Columns the row lacks are left out; bookkeeping columns are mapped too.
-pub fn listing_from_row(row: &Value) -> Value {
-    let mut m = Map::new();
-    for (col, k, kind, _) in FIELDS {
-        let Some(v) = row.get(col) else { continue };
-        let out = match (kind, v) {
-            (_, Value::Null) => Value::Null,
-            (Kind::Bool, v) => Value::Bool(v.as_f64() == Some(1.0) || v == &Value::Bool(true)),
-            (Kind::Int | Kind::Real, v) => v.as_f64().map_or(Value::Null, json_num),
-            (Kind::Text, v) => v.clone(),
-        };
-        m.insert(k.into(), out);
-    }
-    for (col, k) in [("removed_at", "removedAt"), ("fresh_at", "freshAt"), ("first_seen", "firstSeen"), ("last_seen", "lastSeen")] {
-        if let Some(v) = row.get(col) {
-            m.insert(k.into(), v.clone());
-        }
-    }
-    Value::Object(m)
-}
-
 /// What a batch changed (camelCase on the wire, CONTRACT.md).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -374,7 +352,7 @@ pub struct Planner {
     update: String,
     pub stats: SaveStats,
     /// Ids whose scoring inputs changed (new, price, status, comp-only flag,
-    /// relisted, detail read): their groups are rescored. In plan order.
+    /// relisted, detail read). In plan order.
     pub changed: Vec<String>,
     /// Alert-eligible ids (subset of `changed`).
     pub fresh: HashSet<String>,
@@ -542,22 +520,6 @@ pub fn parse_details(body: &Value, now: &str) -> Result<Vec<Detail>, String> {
     Ok(out)
 }
 
-/// Every stored column the scorer, the Deal and the detail merge need (not the description).
-pub fn row_select(alias: &str) -> String {
-    FIELDS
-        .iter()
-        .map(|f| f.0)
-        .filter(|c| *c != "description")
-        .chain(["removed_at", "fresh_at"])
-        .map(|c| format!("{alias}{c}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-pub fn detail_load_queries(ids: &[String]) -> Vec<Stmt> {
-    id_queries(&format!("SELECT {} FROM listings WHERE id", row_select("")), "", ids)
-}
-
 /// The UPDATE for one detail result: only non-null values are written.
 pub fn detail_update(d: &Detail) -> Stmt {
     let cols: Vec<(&str, &str, Kind)> = FIELDS
@@ -569,29 +531,6 @@ pub fn detail_update(d: &Detail) -> Stmt {
     let mut params: Vec<Param> = cols.iter().map(|(_, k, kind)| param(&d.fields, k, *kind)).collect();
     params.push(Param::Text(d.id.clone()));
     Stmt::new(format!("UPDATE listings SET {} WHERE id = ?{}", sets.join(", "), cols.len() + 1), params)
-}
-
-/// The stored listing with the detail merged in (null keeps the stored value).
-pub fn merge_detail(stored: &Value, d: &Detail) -> Value {
-    let mut out = stored.clone();
-    if let (Some(o), Some(f)) = (out.as_object_mut(), d.fields.as_object()) {
-        for (k, v) in f {
-            if !v.is_null() {
-                o.insert(k.clone(), v.clone());
-            }
-        }
-    }
-    out
-}
-
-/// A detail read keeps a listing alert-eligible when it became fresh within
-/// [`FRESH_WINDOW_HOURS`] and is still an active, non-comp-only listing.
-pub fn fresh_after_detail(l: &Value, now: &str) -> bool {
-    let cutoff = iso_minus_hours(now, FRESH_WINDOW_HOURS).unwrap_or_default();
-    l["status"] == "active"
-        && l["compOnly"] != Value::Bool(true)
-        && l.get("removedAt").is_none_or(Value::is_null)
-        && l["freshAt"].as_str().is_some_and(|f| f >= cutoff.as_str())
 }
 
 #[cfg(test)]
@@ -676,7 +615,7 @@ mod tests {
         let mut fresh: Vec<&str> = p.fresh.iter().map(String::as_str).collect();
         fresh.sort();
         assert_eq!(fresh, vec!["unknown-quick", "young"], "quick only; full never makes new listings fresh");
-        assert_eq!(p.changed.len(), 6, "all are stored and their groups scored");
+        assert_eq!(p.changed.len(), 6, "all are stored");
         assert_eq!(p.stats.added, 6);
 
         let mut first = Planner::new(HashMap::new());
@@ -749,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn details_parse_update_and_merge() {
+    fn details_parse_and_update() {
         let d = parse_details(
             &json!({"listings": [{"id": "zl:1", "detailReadAt": T, "waterType": "inland", "frontageFt": 100.4,
                                   "description": "On Torch Lake"}, {"nope": 1}]}),
@@ -761,22 +700,5 @@ mod tests {
         let st = detail_update(&d[0]);
         assert!(st.sql.starts_with("UPDATE listings SET year_built = COALESCE(?1, year_built)"), "{}", st.sql);
         assert!(st.params.iter().filter(|p| p.is_null()).count() >= 3, "absent fields bind null and keep the stored value");
-        let merged = merge_detail(&json!({"id": "zl:1", "waterType": null, "maintenance": 900}), &d[0]);
-        assert_eq!((merged["waterType"].as_str(), merged["maintenance"].as_f64()), (Some("inland"), Some(900.0)));
-    }
-
-    #[test]
-    fn freshness_survives_a_detail_read_for_three_days() {
-        let l = |fresh_at: &str| json!({"status": "active", "compOnly": false, "freshAt": fresh_at});
-        assert!(fresh_after_detail(&l("2026-10-04T12:00:00.000Z"), T));
-        assert!(!fresh_after_detail(&l("2026-10-01T12:00:00.000Z"), T));
-        assert!(!fresh_after_detail(&json!({"status": "active", "freshAt": null}), T));
-    }
-
-    #[test]
-    fn rows_map_back_to_the_contract() {
-        let l = listing_from_row(&json!({"id": "a", "price": 500000.0, "comp_only": 0.0, "home_type": "coop",
-                                         "baths": 1.5, "removed_at": null}));
-        assert_eq!(l, json!({"id": "a", "price": 500000, "homeType": "coop", "baths": 1.5, "compOnly": false, "removedAt": null}));
     }
 }

@@ -10,13 +10,13 @@ db=$(mktemp -t housedeals-explain).db
 trap 'rm -f "$db"' EXIT
 for m in "$dir"/migrations/*.sql; do sqlite3 "$db" < "$m"; done
 q() { printf '\n-- %s\n' "$1"; sqlite3 "$db" "EXPLAIN QUERY PLAN $2"; }
-q "group load: NYC neighbourhood unit, borough fallback, Michigan water units" \
+q "score-input page (GET /api/score-input)" \
 "SELECT l.id FROM listings l LEFT JOIN listing_scores s ON s.listing_id = l.id
- WHERE ((l.market = 'nyc' AND l.neighborhood = 'Astoria' AND l.home_type = 'condo')
-     OR (l.market = 'nyc' AND l.borough = 'queens' AND l.home_type = 'condo' AND l.beds >= 4)
-     OR (l.market = 'mi' AND l.area IN ('petoskey', 'traverse') AND l.water_type = 'inland')
-     OR (l.market = 'mi' AND l.area IN ('petoskey', 'traverse') AND l.water_type IS NULL))
-   AND ((l.status = 'active' AND +l.removed_at IS NULL) OR (l.status = 'sold' AND l.sold_at >= '2025-10-05'))"
+ WHERE l.market = 'nyc' AND l.id > 'se:1'
+   AND ((l.status = 'active' AND l.removed_at IS NULL) OR (l.status = 'sold' AND l.sold_at >= '2025-10-05'))
+ ORDER BY l.id LIMIT 1000"
+q "expiry: scores of removed listings" \
+"DELETE FROM listing_scores WHERE listing_id IN (SELECT id FROM listings WHERE market IN ('nyc', 'mi') AND status = 'active' AND removed_at IS NOT NULL)"
 q "needs-detail mi" \
 "SELECT id, url FROM listings WHERE market = 'mi' AND detail_read_at IS NULL AND status = 'active'
  AND removed_at IS NULL ORDER BY first_seen DESC LIMIT 15"

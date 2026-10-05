@@ -456,6 +456,17 @@ mod tests {
     }
 
     #[test]
+    fn michigan_alerts_only_on_read_lake_frontage() {
+        for (water, alerts) in [(Some("inland"), true), (Some("great_lakes"), true), (Some("other"), false), (None, false)] {
+            let mut all: Vec<Value> = (0..6).map(|i| lake(&format!("c{i}"), "traverse", water, 800_000)).collect();
+            all.push(lake("s", "traverse", water, 600_000));
+            let s = score_of(&all, "s").unwrap();
+            assert!(s.discount_pct >= 15.0);
+            assert_eq!(s.alert, alerts, "water {water:?}");
+        }
+    }
+
+    #[test]
     fn alert_rule_price_cap_and_comp_only() {
         let mut all = comps("c", "Astoria", 2, 10, 1200);
         all.push(apt("big", "Astoria", 2, 950)); // $950k: 20.8% under but over the cap

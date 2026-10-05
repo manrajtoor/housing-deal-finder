@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"regexp"
@@ -62,6 +63,44 @@ type fakeAPI struct {
 	asked   map[string]int
 	details []listing.Detail
 	needs   map[string]apistore.NeedsDetail
+	// rows per market served by ScoreInput (ids as strings), and what was posted.
+	rows   map[string][]string
+	inputs []string // "market after limit"
+	scores []apistore.Scores
+}
+
+func (f *fakeAPI) ScoreInput(_ context.Context, market, after string, limit int) (apistore.ScorePage, error) {
+	f.inputs = append(f.inputs, fmt.Sprintf("%s %q %d", market, after, limit))
+	p := apistore.ScorePage{Market: market, Columns: json.RawMessage(`["id"]`), Rows: []json.RawMessage{}}
+	for _, id := range f.rows[market] {
+		if id > after && len(p.Rows) < limit {
+			p.Rows = append(p.Rows, json.RawMessage(`["`+id+`"]`))
+			last := id
+			p.Last = &last
+		}
+	}
+	p.N = len(p.Rows)
+	return p, nil
+}
+
+func (f *fakeAPI) PostScores(_ context.Context, s apistore.Scores) (apistore.ScoresStats, error) {
+	f.scores = append(f.scores, s)
+	return apistore.ScoresStats{Upserted: len(s.Upserts), Deleted: len(s.Deletes), NewAlerts: len(s.Alerts)}, nil
+}
+
+// fakeScorer records its input and answers with fixed writes.
+type fakeScorer struct {
+	inputs []map[string]any
+	out    string
+}
+
+func (f *fakeScorer) Score(_ context.Context, input []byte) ([]byte, error) {
+	var m map[string]any
+	if err := json.Unmarshal(input, &m); err != nil {
+		return nil, err
+	}
+	f.inputs = append(f.inputs, m)
+	return []byte(f.out), nil
 }
 
 func (f *fakeAPI) Push(_ context.Context, ls []listing.Listing, s apistore.Scope) (apistore.Stats, error) {
@@ -106,7 +145,7 @@ func TestQuickPushesEverySearchThenReadsDetails(t *testing.T) {
 	if api.pushes[0].n != 7 || api.pushes[1].n != 6 || api.pushes[1].scope.Source != "zillow" {
 		t.Errorf("pushes = %+v", api.pushes)
 	}
-	if api.asked["nyc"] != 15 || api.asked["mi"] != 15 {
+	if api.asked["nyc"] != 6 || api.asked["mi"] != 6 {
 		t.Errorf("needs-detail limits = %v", api.asked)
 	}
 	if len(api.details) != 2 {
@@ -364,5 +403,132 @@ func TestBandSplitStopsWhenThePriceFilterIsIgnored(t *testing.T) {
 	}
 	if len(site.asked) != 5*3 {
 		t.Errorf("asked %d pages, want 3 per borough", len(site.asked))
+	}
+}
+
+func TestBlockedDetailPageIsAWarningNotAFailure(t *testing.T) {
+	pages := site(t, false)
+	pages[zlDetailURL] = `<html><div id="px-captcha"></div></html>`
+	api := &fakeAPI{needs: map[string]apistore.NeedsDetail{
+		"mi": {IDs: []string{"zl:94778208", "zl:2"}, URLs: []string{zlDetailURL, zlDetailURL}},
+	}}
+	var logs bytes.Buffer
+	res := Run(context.Background(), Config{
+		Mode: ModeQuick, Markets: []string{"mi"}, DetailLimit: -1, Fetcher: countFetches{pages, new(int)},
+		API: api, Log: log.New(&logs, "", 0), Now: now,
+	})
+	if len(res.Failures) != 0 {
+		t.Fatalf("failures = %v", res.Failures)
+	}
+	if !strings.Contains(logs.String(), "WARNING detail mi: blocked, no more detail reads this run") {
+		t.Errorf("logs:\n%s", logs.String())
+	}
+	pages[zlDetailURL] = "<html>a page that changed shape</html>"
+	res = Run(context.Background(), Config{Mode: ModeQuick, Markets: []string{"mi"}, DetailLimit: -1, Fetcher: pages, API: api, Now: now})
+	if len(res.Failures) != 1 || !strings.Contains(res.Failures[0], "detail mi: stopping") {
+		t.Errorf("a parse error still fails the run: %v", res.Failures)
+	}
+}
+
+type countFetches struct {
+	pages fetch.Pages
+	n     *int
+}
+
+func (c countFetches) Fetch(ctx context.Context, u string) (string, error) {
+	*c.n++
+	return c.pages.Fetch(ctx, u)
+}
+
+func TestDetailPagesAreSpacedByDetailDelay(t *testing.T) {
+	api := &fakeAPI{needs: map[string]apistore.NeedsDetail{
+		"mi": {IDs: []string{"zl:1", "zl:2", "zl:3"}, URLs: []string{zlDetailURL, zlDetailURL, zlDetailURL}},
+	}}
+	start := time.Now()
+	res := Run(context.Background(), Config{
+		Mode: ModeQuick, Markets: []string{"mi"}, MaxPages: 1, DetailLimit: -1, Fetcher: site(t, false),
+		API: api, Now: now, DetailDelay: 40 * time.Millisecond,
+	})
+	if len(res.Failures) != 0 || len(api.details) != 3 {
+		t.Fatalf("failures %v details %d", res.Failures, len(api.details))
+	}
+	if d := time.Since(start); d < 80*time.Millisecond {
+		t.Errorf("3 detail pages took %v, want >= 2 x 40ms", d)
+	}
+}
+
+func TestScoringPagesRunsTheScorerAndPostsChunksAlertsFirst(t *testing.T) {
+	defer func(n int) { scorePageSize = n }(scorePageSize)
+	scorePageSize = 2
+	api := &fakeAPI{rows: map[string][]string{"mi": {"zl:1", "zl:2", "zl:3", "zl:4", "zl:5"}, "nyc": {"se:1"}}}
+	var ups, dels, alerts []string
+	for i := 0; i < 60; i++ {
+		ups = append(ups, fmt.Sprintf(`{"id":"zl:u%d"}`, i))
+	}
+	for i := 0; i < 5; i++ {
+		dels = append(dels, fmt.Sprintf(`"zl:d%d"`, i))
+	}
+	for i := 0; i < 3; i++ {
+		alerts = append(alerts, fmt.Sprintf(`{"id":"zl:a%d"}`, i))
+	}
+	sc := &fakeScorer{out: `{"market":"mi","upserts":[` + strings.Join(ups, ",") + `],"deletes":[` + strings.Join(dels, ",") +
+		`],"alerts":[` + strings.Join(alerts, ",") + `],"stats":{}}`}
+	var logs bytes.Buffer
+	res := Run(context.Background(), Config{
+		Mode: ModeSold, Markets: []string{"nyc", "mi"}, MaxPages: 1, DetailLimit: -1,
+		Fetcher: site(t, true), API: api, Scorer: sc, Log: log.New(&logs, "", 0), Now: now,
+	})
+	if len(res.Failures) != 0 {
+		t.Fatalf("failures %v\n%s", res.Failures, logs.String())
+	}
+	if fmt.Sprint(api.inputs) != `[mi "" 2 mi "zl:2" 2 mi "zl:4" 2]` {
+		t.Errorf("score-input calls %v (sold mode crawls Michigan only)", api.inputs)
+	}
+	if len(sc.inputs) != 1 || sc.inputs[0]["market"] != "mi" || sc.inputs[0]["now"] != "2026-10-05T12:00:00Z" ||
+		len(sc.inputs[0]["rows"].([]any)) != 5 || fmt.Sprint(sc.inputs[0]["columns"]) != "[id]" {
+		t.Errorf("scorer input %v", sc.inputs)
+	}
+	if len(api.scores) != 2 {
+		t.Fatalf("posts %d", len(api.scores))
+	}
+	c0, c1 := api.scores[0], api.scores[1]
+	if len(c0.Alerts) != 3 || len(c0.Upserts) != 44 || len(c0.Deletes) != 0 || c0.Market != "mi" {
+		t.Errorf("chunk 1: %d alerts %d upserts %d deletes", len(c0.Alerts), len(c0.Upserts), len(c0.Deletes))
+	}
+	if len(c1.Alerts) != 0 || len(c1.Upserts) != 16 || len(c1.Deletes) != 5 {
+		t.Errorf("chunk 2: %d alerts %d upserts %d deletes", len(c1.Alerts), len(c1.Upserts), len(c1.Deletes))
+	}
+	if !strings.Contains(logs.String(), "score mi: rows 5, upserts 60, deletes 5, alerts 3 (new 3, refreshed 0)") {
+		t.Errorf("logs:\n%s", logs.String())
+	}
+}
+
+func TestNoScoringOnADryRunOrWithoutAScorer(t *testing.T) {
+	api := &fakeAPI{}
+	sc := &fakeScorer{out: `{}`}
+	Run(context.Background(), Config{Mode: ModeQuick, Markets: []string{"mi"}, DetailLimit: 0, DryRun: true,
+		Fetcher: site(t, false), API: api, Scorer: sc, Out: io.Discard, Now: now})
+	var logs bytes.Buffer
+	Run(context.Background(), Config{Mode: ModeQuick, Markets: []string{"mi"}, DetailLimit: 0,
+		Fetcher: site(t, false), API: api, Log: log.New(&logs, "", 0), Now: now})
+	if len(sc.inputs) != 0 || len(api.inputs) != 0 || !strings.Contains(logs.String(), "score: skipped") {
+		t.Errorf("scored: %v %v\n%s", sc.inputs, api.inputs, logs.String())
+	}
+}
+
+func TestBlocked(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want bool
+	}{
+		{&fetch.HTTPError{Status: 403}, true},
+		{&fetch.HTTPError{Status: 429}, true},
+		{&fetch.HTTPError{Status: 500}, false},
+		{&fetch.ParseError{Msg: "zillow detail: no __NEXT_DATA__ in the page (bot check page)"}, true},
+		{&fetch.ParseError{Msg: "zillow detail: no property in gdpClientCache"}, false},
+	} {
+		if got := blocked(c.err); got != c.want {
+			t.Errorf("blocked(%v) = %v", c.err, got)
+		}
 	}
 }

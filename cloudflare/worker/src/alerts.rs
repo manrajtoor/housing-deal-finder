@@ -1,18 +1,14 @@
-//! Alerts: a fresh listing (new and young, relisted, or cheaper) whose score
-//! passes the alert rule (`scorer::AlertRule`, set in the Deal's `alert`) is
-//! stored once in `deal_alerts`, keyed by (listing id, asking price), and
-//! handed to a [`Notifier`]. There is no notifier yet (dashboard only); the
-//! trait is the seam for one.
+//! Alerts: the crawl job (`housedeals-score`) decides which fresh listings
+//! (new and young, relisted, or cheaper) pass the alert rule and posts them
+//! to `POST /api/scores`, which stores each once in `deal_alerts`, keyed by
+//! (listing id, asking price), and hands the new ones to a [`Notifier`].
+//! There is no notifier yet (dashboard only); the trait is the seam for one.
+//!
+//! The Worker reads the rule only for NYC needs-detail (`ALERT_MAX_PRICE`).
 
 use serde_json::Value;
 
 use scorer::AlertRule;
-
-use crate::scores::{parse_limit, parse_market};
-use crate::sql::{Param, Stmt};
-
-pub const DEFAULT_LIST_LIMIT: usize = 50;
-pub const MAX_LIST_LIMIT: usize = 500;
 
 /// Delivers new alerts somewhere (e-mail, Telegram, ...). Returns how many
 /// it delivered; delivered alerts get `notified_at`.
@@ -62,86 +58,9 @@ pub fn rule_from_vars(get: impl Fn(&str) -> Option<String>) -> (AlertRule, Vec<S
     (r, errors)
 }
 
-/// One alert to store.
-#[derive(Debug, Clone, PartialEq)]
-pub struct NewAlert {
-    pub listing_id: String,
-    pub price: i64,
-    pub market: String,
-    pub deal: Value,
-}
-
-/// INSERT OR IGNORE: the same (listing, price) is never stored twice; the
-/// statement's `changes` (1 or 0) tells whether this one is new.
-pub fn insert_statement(a: &NewAlert, now: &str) -> Stmt {
-    Stmt::new(
-        "INSERT OR IGNORE INTO deal_alerts (listing_id, price, market, created_at, deal) VALUES (?1, ?2, ?3, ?4, ?5)",
-        vec![
-            Param::Text(a.listing_id.clone()),
-            Param::Int(a.price),
-            Param::Text(a.market.clone()),
-            Param::Text(now.to_string()),
-            Param::Text(a.deal.to_string()),
-        ],
-    )
-}
-
-/// After a detail read: the stored alert for this (listing, price), if any,
-/// shows the newly read fields (maintenance, water body, ...).
-pub fn patch_statement(listing_id: &str, price: i64, deal: &Value) -> Stmt {
-    Stmt::new(
-        "UPDATE deal_alerts SET deal = ?1 WHERE listing_id = ?2 AND price = ?3",
-        vec![Param::Text(deal.to_string()), Param::Text(listing_id.to_string()), Param::Int(price)],
-    )
-}
-
-pub fn notified_statement(a: &NewAlert, now: &str) -> Stmt {
-    Stmt::new(
-        "UPDATE deal_alerts SET notified_at = ?1 WHERE listing_id = ?2 AND price = ?3",
-        vec![Param::Text(now.to_string()), Param::Text(a.listing_id.clone()), Param::Int(a.price)],
-    )
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct AlertsQuery {
-    pub market: Option<String>,
-    pub limit: usize,
-}
-
-impl AlertsQuery {
-    pub fn from_pairs<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<AlertsQuery, String> {
-        let mut q = AlertsQuery { market: None, limit: DEFAULT_LIST_LIMIT };
-        for (k, v) in pairs {
-            match k {
-                "market" => q.market = parse_market(v)?,
-                "limit" if !v.trim().is_empty() => q.limit = parse_limit(v, MAX_LIST_LIMIT)?,
-                _ => {}
-            }
-        }
-        Ok(q)
-    }
-}
-
-/// Newest first:
-///   SEARCH deal_alerts USING INDEX idx_alerts_market_created (market=?)
-///   SCAN deal_alerts USING INDEX idx_alerts_created (no market)
-pub fn list_query(q: &AlertsQuery) -> Stmt {
-    match &q.market {
-        Some(m) => Stmt::new(
-            "SELECT deal, created_at FROM deal_alerts WHERE market = ?1 ORDER BY created_at DESC LIMIT ?2",
-            vec![Param::Text(m.clone()), Param::Int(q.limit as i64)],
-        ),
-        None => Stmt::new(
-            "SELECT deal, created_at FROM deal_alerts ORDER BY created_at DESC LIMIT ?1",
-            vec![Param::Int(q.limit as i64)],
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn rule_reads_the_vars_and_reports_bad_ones() {
@@ -154,16 +73,5 @@ mod tests {
         });
         assert_eq!((r.max_price, r.min_discount_pct, r.min_comps_nyc, r.min_comps_mi), (900000.0, 12.0, 8, 5));
         assert_eq!(e.len(), 1);
-    }
-
-    #[test]
-    fn statements_and_queries() {
-        let a = NewAlert { listing_id: "se:1".into(), price: 500000, market: "nyc".into(), deal: json!({"id": "se:1"}) };
-        let s = insert_statement(&a, "T");
-        assert!(s.sql.starts_with("INSERT OR IGNORE INTO deal_alerts"));
-        assert_eq!(s.params[1], Param::Int(500000));
-        let q = AlertsQuery::from_pairs([("market", "mi"), ("limit", "5")]).unwrap();
-        assert_eq!(list_query(&q).params, vec![Param::Text("mi".into()), Param::Int(5)]);
-        assert!(AlertsQuery::from_pairs([("market", "x")]).is_err());
     }
 }

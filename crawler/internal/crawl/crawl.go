@@ -1,11 +1,14 @@
 // Package crawl runs one crawl: the searches of a mode, a push per search,
-// then the detail pages the Worker asks for.
+// then the detail pages the Worker asks for, then the scoring of each
+// market crawled (the Worker only stores; see Scorer).
 //
 // Every request goes through the one Fetcher it is given (the CLI wraps a
-// single 1.5 s Throttle around it). A source stops at its first error that
-// survived the fetcher's retries (a 403, a bot-check page, a page that
-// changed shape); what it gathered before is still pushed, and Run reports
-// the failure so the CLI exits non-zero.
+// single 1.5 s Throttle around it); detail pages are also spaced by
+// DetailDelay. A source stops at its first error that survived the
+// fetcher's retries (a 403, a bot-check page, a page that changed shape);
+// what it gathered before is still pushed, and Run reports the failure so
+// the CLI exits non-zero. A detail page that is blocked (403, 429, a bot
+// check) only stops that market's detail reads, with a warning.
 package crawl
 
 import (
@@ -39,6 +42,14 @@ type API interface {
 	Push(ctx context.Context, listings []listing.Listing, scope apistore.Scope) (apistore.Stats, error)
 	NeedsDetail(ctx context.Context, market string, limit int) (apistore.NeedsDetail, error)
 	PushDetails(ctx context.Context, details []listing.Detail) (apistore.DetailStats, error)
+	ScoreInput(ctx context.Context, market, after string, limit int) (apistore.ScorePage, error)
+	PostScores(ctx context.Context, s apistore.Scores) (apistore.ScoresStats, error)
+}
+
+// Scorer turns one market's scoring input into the writes for POST
+// /api/scores (the housedeals-score binary; see scorer/src/batch.rs).
+type Scorer interface {
+	Score(ctx context.Context, input []byte) ([]byte, error)
 }
 
 // Config is one run.
@@ -55,9 +66,14 @@ type Config struct {
 	DryRun  bool
 	Fetcher fetch.Fetcher
 	API     API // nil: no Worker
-	Out     io.Writer
-	Log     *log.Logger
-	Now     func() time.Time
+	// Scorer scores each market crawled after the searches and detail
+	// reads; nil skips scoring.
+	Scorer Scorer
+	// DetailDelay spaces detail pages, on top of the Fetcher's own throttle.
+	DetailDelay time.Duration
+	Out         io.Writer
+	Log         *log.Logger
+	Now         func() time.Time
 }
 
 // DefaultMaxPages is the per-search page cap of each mode.
@@ -75,9 +91,9 @@ func DefaultMaxPages(mode string) int {
 func DefaultDetailLimit(mode string) int {
 	switch mode {
 	case ModeQuick:
-		return 15
+		return 6
 	case ModeFull:
-		return 40
+		return 20
 	}
 	return 0
 }
@@ -93,6 +109,8 @@ type runner struct {
 	cfg    Config
 	seenAt string
 	res    Result
+	// detail fetches pages through an extra DetailDelay throttle.
+	detail fetch.Fetcher
 }
 
 // Run crawls. It returns what it gathered; Failures lists the errors that
@@ -110,15 +128,21 @@ func Run(ctx context.Context, cfg Config) Result {
 	if cfg.DetailLimit < 0 {
 		cfg.DetailLimit = DefaultDetailLimit(cfg.Mode)
 	}
-	r := &runner{cfg: cfg, seenAt: listing.Timestamp(cfg.Now())}
+	r := &runner{cfg: cfg, seenAt: listing.Timestamp(cfg.Now()), detail: cfg.Fetcher}
+	if cfg.DetailDelay > 0 {
+		r.detail = fetch.NewThrottle(cfg.DetailDelay).Wrap(cfg.Fetcher)
+	}
 	r.res.Listings = []listing.Listing{}
 	r.res.Details = []listing.Detail{}
 
+	var crawled []string
 	if r.has(listing.MarketNYC) && cfg.Mode != ModeSold {
 		r.streetEasy(ctx)
+		crawled = append(crawled, listing.MarketNYC)
 	}
 	if r.has(listing.MarketMI) {
 		r.zillow(ctx)
+		crawled = append(crawled, listing.MarketMI)
 	}
 	if cfg.Mode != ModeSold && cfg.DetailLimit > 0 {
 		if cfg.API == nil {
@@ -129,6 +153,15 @@ func Run(ctx context.Context, cfg Config) Result {
 					r.details(ctx, m)
 				}
 			}
+		}
+	}
+	switch {
+	case cfg.DryRun || cfg.API == nil:
+	case cfg.Scorer == nil:
+		cfg.Log.Printf("score: skipped (no scorer)")
+	default:
+		for _, m := range crawled {
+			r.score(ctx, m)
 		}
 	}
 	if cfg.DryRun && cfg.Out != nil {
@@ -342,7 +375,7 @@ func (r *runner) details(ctx context.Context, market string) {
 			r.cfg.Log.Printf("detail %s: skipping %s: URL %q is not on %s", market, id, u, detailHosts[market])
 			continue
 		}
-		body, err := r.cfg.Fetcher.Fetch(ctx, u)
+		body, err := r.detail.Fetch(ctx, u)
 		var he *fetch.HTTPError
 		if errors.As(err, &he) && (he.Status == http.StatusNotFound || he.Status == http.StatusGone) {
 			gone++
@@ -374,9 +407,115 @@ func (r *runner) details(ctx context.Context, market string) {
 		push = "nothing to push"
 	}
 	r.cfg.Log.Printf("detail %s %s: asked %d, read %d, gone %d, %s", market, r.cfg.Mode, len(nd.IDs), read, gone, push)
-	if stopErr != nil {
+	switch {
+	case stopErr == nil:
+	case blocked(stopErr):
+		// The site wants a break: no more detail pages this run, but the
+		// listings and scores are fine, so the run does not fail for it.
+		r.cfg.Log.Printf("WARNING detail %s: blocked, no more detail reads this run: %v", market, stopErr)
+	default:
 		r.fail("detail %s: stopping: %v", market, stopErr)
 	}
+}
+
+// blocked reports a 403 / 429 or a bot-check page.
+func blocked(err error) bool {
+	var he *fetch.HTTPError
+	if errors.As(err, &he) {
+		return he.Status == http.StatusForbidden || he.Status == http.StatusTooManyRequests
+	}
+	return strings.Contains(err.Error(), "bot check")
+}
+
+// scorePageSize is how many rows each score-input request asks for (tests shrink it).
+var scorePageSize = apistore.ScoreInputPageSize
+
+// scoreChunk is the most "statements" one POST /api/scores carries: an
+// upsert or a delete is one, an alert two (insert, refresh).
+const scoreChunk = 50
+
+// score reads market's scoring rows from the Worker, runs the scorer on
+// them and posts its writes in chunks, alerts first (so a failed post never
+// leaves a rewritten score whose alert was lost: the next run retries).
+func (r *runner) score(ctx context.Context, market string) {
+	var rows []json.RawMessage
+	var columns json.RawMessage
+	after := ""
+	for {
+		p, err := r.cfg.API.ScoreInput(ctx, market, after, scorePageSize)
+		if err != nil {
+			r.fail("score %s: score-input after %q: %v", market, after, err)
+			return
+		}
+		columns = p.Columns
+		rows = append(rows, p.Rows...)
+		if p.Last == nil || p.N < scorePageSize {
+			break
+		}
+		after = *p.Last
+	}
+	if rows == nil {
+		rows = []json.RawMessage{}
+	}
+	input, err := json.Marshal(map[string]any{
+		"market": market, "now": listing.Timestamp(r.cfg.Now()), "columns": columns, "rows": rows,
+	})
+	if err != nil {
+		r.fail("score %s: %v", market, err)
+		return
+	}
+	raw, err := r.cfg.Scorer.Score(ctx, input)
+	if err != nil {
+		r.fail("score %s: scorer: %v", market, err)
+		return
+	}
+	var w apistore.Scores
+	if err := json.Unmarshal(raw, &w); err != nil {
+		r.fail("score %s: scorer output is not JSON: %v", market, err)
+		return
+	}
+	var total apistore.ScoresStats
+	posted := 0
+	for _, c := range chunkScores(market, w) {
+		s, err := r.cfg.API.PostScores(ctx, c)
+		if err != nil {
+			r.fail("score %s: post scores: %v (posted %d chunks before failing)", market, err, posted)
+			return
+		}
+		posted++
+		total = total.Add(s)
+	}
+	r.cfg.Log.Printf("score %s: rows %d, upserts %d, deletes %d, alerts %d (new %d, refreshed %d)",
+		market, len(rows), total.Upserted, total.Deleted, len(w.Alerts), total.NewAlerts, total.PatchedAlerts)
+}
+
+// chunkScores cuts the writes into POST bodies of at most scoreChunk
+// statements: alerts first, then upserts, then deletes.
+func chunkScores(market string, w apistore.Scores) []apistore.Scores {
+	var out []apistore.Scores
+	cur := apistore.Scores{Market: market}
+	used := 0
+	add := func(cost int, put func(*apistore.Scores)) {
+		if used+cost > scoreChunk {
+			out = append(out, cur)
+			cur, used = apistore.Scores{Market: market}, 0
+		}
+		put(&cur)
+		used += cost
+	}
+	for _, a := range w.Alerts {
+		add(2, func(s *apistore.Scores) { s.Alerts = append(s.Alerts, a) })
+	}
+	for _, u := range w.Upserts {
+		add(1, func(s *apistore.Scores) { s.Upserts = append(s.Upserts, u) })
+	}
+	for _, d := range w.Deletes {
+		add(1, func(s *apistore.Scores) { s.Deletes = append(s.Deletes, d) })
+	}
+	if used > 0 {
+		out = append(out, cur)
+	}
+	return out
 }
 
 func (r *runner) parseDetail(market, id, body string) (listing.Detail, error) {

@@ -1,7 +1,7 @@
 //! housedeals scorer: comp-based baselines for homes for sale (DESIGN.md).
 //!
-//! Pure Rust with no wasm or Workers dependencies; the Worker links it and
-//! `cargo test` runs it natively.
+//! Pure Rust with no wasm or Workers dependencies. The crawl job runs it as
+//! the `housedeals-score` binary; `cargo test` runs it natively.
 //!
 //! Module map:
 //! - [`listing`] the facts read from a contract listing, and the Deal fields
@@ -10,8 +10,10 @@
 //! - [`alert`]   the alert rule
 //! - [`stats`]   medians and percentiles (with one element left out)
 //! - [`dates`]   ISO date arithmetic
+//! - [`batch`]   one market's scoring pass for the crawl job (`housedeals-score`)
 
 pub mod alert;
+pub mod batch;
 pub mod dates;
 pub mod group;
 pub mod listing;

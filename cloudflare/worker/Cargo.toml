@@ -2,16 +2,17 @@
 name = "housedeals-worker"
 version = "0.1.0"
 edition = "2021"
-description = "Cloudflare Worker housedeals-api: ingest listings into D1, score touched groups, serve deals"
+description = "Cloudflare Worker housedeals-api: store listings in D1, hand them to the crawl job for scoring, serve deals"
 publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# Only for its date helpers and AlertRule: the Worker does not score.
 housedeals-scorer = { path = "../../scorer" }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 
 # The Workers runtime bindings are only needed (and only built) for wasm32.
 # Everything else is tested natively with `cargo test`.

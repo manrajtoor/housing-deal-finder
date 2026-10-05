@@ -1,6 +1,8 @@
 //! The alert rule (DESIGN.md): at least 15% under the baseline, enough comps
 //! for the market, not a thin (fallback) group, at most $900k, an active
-//! listing the crawler did not mark comp-only, and never `access` water.
+//! listing the crawler did not mark comp-only, and in Michigan only
+//! `great_lakes` or `inland` frontage: unread (`other`), river/pond and
+//! shared `access` listings are scored but never alert.
 //! The 50% plausibility cap is enforced by the scorer itself (it refuses).
 
 use crate::listing::{Facts, Market};
@@ -36,6 +38,6 @@ impl AlertRule {
             && f.active
             && !f.removed
             && !f.comp_only
-            && f.water != "access"
+            && (f.market != Market::Mi || f.water == "great_lakes" || f.water == "inland")
     }
 }

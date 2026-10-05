@@ -37,11 +37,10 @@ GITHUB_WORKFLOW = "crawl.yml"
 # .dev.vars sets "true" for local curl testing.
 PUBLIC_READ_API = "false"
 EXPIRE_AFTER_DAYS = "3"
-# Alert rule (scorer::AlertRule): Deal.alert and new rows in deal_alerts.
+# The alert rule is applied by the crawl job's scorer (housedeals-score
+# flags, defaults 15% / 8 NYC comps / 6 Michigan comps / $900k). The Worker
+# only uses the price ceiling, to pick NYC listings for detail reads.
 ALERT_MAX_PRICE = "900000"
-ALERT_MIN_DISCOUNT_PCT = "15"
-ALERT_MIN_COMPS_NYC = "8"
-ALERT_MIN_COMPS_MI = "6"
 
 # Secrets (never in this file):
 #   INGEST_TOKEN           npx wrangler secret put INGEST_TOKEN   (local: .dev.vars)
