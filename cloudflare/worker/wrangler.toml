@@ -3,7 +3,7 @@
 
 name = "housedeals-api"
 main = "build/index.js"
-compatibility_date = "2026-09-01"
+compatibility_date = "2026-05-03"
 account_id = "7377038a87d0e600e53c1e5039c7b89a"
 
 # Public at https://housedeals-api.<subdomain>.workers.dev: /api/health and
