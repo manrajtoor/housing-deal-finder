@@ -1,0 +1,32 @@
+name: probe
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe sources
+        run: |
+          UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+          probe() {
+            out=$(curl -s -m 25 -o body.txt -w "%{http_code} %{size_download}" -A "$UA" \
+              -H "accept-language: en-US,en;q=0.9" -H "accept: ${ACCEPT:-text/html,application/xhtml+xml,*/*}" ${REF:+-H "referer: $REF"} "$1")
+            title=$(grep -o -i '<title>[^<]*' body.txt | head -1 | cut -c8-80)
+            echo "$out | $1 | ${title:-$(head -c 120 body.txt | tr -d '\n')}"
+            sleep 2
+          }
+          ACCEPT='application/json, text/plain, */*' REF=https://newyork.craigslist.org/ probe "https://sapi.craigslist.org/web/v8/postings/search/full?batch=3-0-360-0-0&cc=US&lang=en&searchPath=rea&max_price=900000&min_bedrooms=2"
+          ACCEPT='application/json, text/plain, */*' REF=https://nmi.craigslist.org/ probe "https://sapi.craigslist.org/web/v8/postings/search/full?batch=309-0-360-0-0&cc=US&lang=en&searchPath=rea&max_price=900000"
+          ACCEPT='application/json' probe "https://data.cityofnewyork.us/resource/usep-8jbt.json?\$limit=1"
+          probe "https://www.zillow.com/traverse-city-mi/"
+          probe "https://www.zillow.com/homes/for_sale/Leelanau-County,-MI_rb/"
+          probe "https://streeteasy.com/for-sale/nyc/price:-900000%7Cbeds:2-"
+          probe "https://www.trulia.com/MI/Traverse_City/"
+          probe "https://www.redfin.com/city/19284/MI/Traverse-City"
+          probe "https://www.realtor.com/realestateandhomes-search/Traverse-City_MI"
+          probe "https://www.homes.com/traverse-city-mi/"
+          probe "https://www.compass.com/homes-for-sale/traverse-city-mi/"
+          probe "https://www.movoto.com/traverse-city-mi/"
+          probe "https://www.landwatch.com/michigan-land-for-sale/grand-traverse-county/waterfront-property"
