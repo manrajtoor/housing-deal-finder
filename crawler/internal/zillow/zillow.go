@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"housedeals/crawler/internal/fetch"
+	"housedeals/crawler/internal/geo"
 	"housedeals/crawler/internal/jsonx"
 	"housedeals/crawler/internal/listing"
 	"housedeals/crawler/internal/water"
@@ -213,6 +214,13 @@ func toListing(r map[string]any, c County, sold bool) (listing.Listing, bool) {
 	if l.Lat == nil {
 		l.Lat = jsonx.NumPtr(jsonx.Get(r, "latLong", "latitude"))
 		l.Lon = jsonx.NumPtr(jsonx.Get(r, "latLong", "longitude"))
+	}
+	if l.Lat != nil && l.Lon != nil {
+		// Water from the map; a detail read's description replaces it later.
+		if typ, body, _, ok := geo.Classify(*l.Lat, *l.Lon); ok {
+			l.WaterType, l.WaterBody = listing.Str(typ), listing.Str(body)
+			l.WaterSource = listing.Ptr(listing.WaterFromMap)
+		}
 	}
 	if b, ok := jsonx.Int(firstOf(hi["bedrooms"], r["beds"])); ok && b >= 0 {
 		l.Beds = &b

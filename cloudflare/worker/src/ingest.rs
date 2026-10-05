@@ -1,5 +1,12 @@
 //! POST /api/listings and POST /api/listings/detail, planned as statements.
 //!
+//! Water facts (`waterType`, `waterBody`, `waterSource`): a search card may
+//! carry them from the map (`waterSource: "map"`, the crawler's offline
+//! geography). They are stored only while the row has no `detail_read_at`
+//! (checked in the UPDATE itself), so a description, once read, wins. A
+//! detail read that names a water type overwrites all three
+//! (`waterSource: "description"`); one that names none keeps what is there.
+//!
 //! Upsert rules:
 //! - New id: insert, plus a price_history row.
 //! - Known id, nothing new (same price, status and comp-only flag, not back
@@ -55,7 +62,7 @@ pub enum Kind {
 
 /// (column, contract field, kind, sticky). Sticky columns come from the
 /// detail page: a push without a detail read never overwrites them.
-pub const FIELDS: [(&str, &str, Kind, bool); 34] = [
+pub const FIELDS: [(&str, &str, Kind, bool); 35] = [
     ("id", "id", Kind::Text, false),
     ("source", "source", Kind::Text, false),
     ("market", "market", Kind::Text, false),
@@ -85,6 +92,7 @@ pub const FIELDS: [(&str, &str, Kind, bool); 34] = [
     ("description", "description", Kind::Text, true),
     ("water_type", "waterType", Kind::Text, true),
     ("water_body", "waterBody", Kind::Text, true),
+    ("water_source", "waterSource", Kind::Text, true),
     ("frontage_ft", "frontageFt", Kind::Int, true),
     ("maintenance", "maintenance", Kind::Int, true),
     ("taxes", "taxes", Kind::Int, true),
@@ -92,9 +100,16 @@ pub const FIELDS: [(&str, &str, Kind, bool); 34] = [
     ("comp_only", "compOnly", Kind::Bool, false),
 ];
 
-/// Fields only a detail page provides (`yearBuilt` may come from either).
-pub const DETAIL_ONLY: [&str; 7] =
-    ["description", "waterType", "waterBody", "frontageFt", "maintenance", "taxes", "detailReadAt"];
+/// Fields only a detail page provides (`yearBuilt` may come from either;
+/// the water fields also from the map, see [`normalize`]).
+pub const DETAIL_ONLY: [&str; 8] =
+    ["description", "waterType", "waterBody", "waterSource", "frontageFt", "maintenance", "taxes", "detailReadAt"];
+
+/// The water columns, written by their own rules (module comment).
+const WATER: [&str; 3] = ["waterType", "waterBody", "waterSource"];
+
+pub const WATER_FROM_MAP: &str = "map";
+pub const WATER_FROM_DESCRIPTION: &str = "description";
 
 /// Which crawl sent the batch.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -175,7 +190,9 @@ fn num_field(l: &Value, k: &str, lo: f64, hi: f64) -> Result<Option<f64>, String
 /// A clean contract listing: known fields only, trimmed and length-capped
 /// strings, whole numbers where the contract says int, enums checked. Detail
 /// fields are dropped unless `detailReadAt` is set, so they can never blank
-/// stored ones.
+/// stored ones; the exception is map water (`waterSource: "map"` with a
+/// known `waterType`) on a card. `waterSource` is "description" for a detail
+/// read with a water type, "map" for map water, null otherwise.
 pub fn normalize(l: &Value, scope: &Scope) -> Result<Value, String> {
     if !l.is_object() {
         return Err("not an object".into());
@@ -236,7 +253,42 @@ pub fn normalize(l: &Value, scope: &Scope) -> Result<Value, String> {
         };
         out.insert(k.into(), v);
     }
+    let water_type = opt_str(l.get("waterType")).filter(|t| WATER_TYPES.contains(t));
+    let source = match (detail_read_at, water_type) {
+        (Some(_), Some(_)) => Some(WATER_FROM_DESCRIPTION),
+        (None, Some(t)) if opt_str(l.get("waterSource")) == Some(WATER_FROM_MAP) => {
+            out.insert("waterType".into(), Value::from(t));
+            let body = opt_str(l.get("waterBody")).map_or(Value::Null, |b| Value::from(clip(b, MAX_TEXT_CHARS)));
+            out.insert("waterBody".into(), body);
+            Some(WATER_FROM_MAP)
+        }
+        _ => None,
+    };
+    out.insert("waterSource".into(), source.map_or(Value::Null, Value::from));
     Ok(Value::Object(out))
+}
+
+/// SET clauses for the water columns. `fields` are the bound fields in
+/// parameter order (1-based), `detail` the number of the parameter that is 1
+/// when the push carries a detail read. A detail read with a water type
+/// writes all three; otherwise only a row never detail-read takes the card's
+/// (map) values, nulls included, so a stale map value can be cleared.
+fn water_sets(fields: &[&str], detail: Option<usize>) -> Vec<String> {
+    let at = |k: &str| fields.iter().position(|f| *f == k).map(|i| i + 1).unwrap_or(0);
+    let wt = at("waterType");
+    WATER
+        .iter()
+        .map(|k| {
+            let (c, i) = (FIELDS.iter().find(|f| f.1 == *k).map_or("", |f| f.0), at(k));
+            let from_detail = format!("CASE WHEN ?{wt} IS NOT NULL THEN ?{i} ELSE {c} END");
+            match detail {
+                None => format!("{c} = {from_detail}"),
+                Some(d) => format!(
+                    "{c} = CASE WHEN ?{d} = 1 THEN {from_detail} WHEN detail_read_at IS NULL THEN ?{i} ELSE {c} END"
+                ),
+            }
+        })
+        .collect()
 }
 
 fn param(l: &Value, k: &str, kind: Kind) -> Param {
@@ -275,11 +327,14 @@ pub struct Existing {
     pub status: Option<String>,
     pub comp_only: bool,
     pub detail_read_at: Option<String>,
+    /// Stored water, to notice a changed map classification.
+    pub water_type: Option<String>,
+    pub water_body: Option<String>,
 }
 
 pub fn existing_queries(ids: &[String]) -> Vec<Stmt> {
     id_queries(
-        "SELECT id, price, removed_at, last_seen, status, comp_only, detail_read_at FROM listings WHERE id",
+        "SELECT id, price, removed_at, last_seen, status, comp_only, detail_read_at, water_type, water_body FROM listings WHERE id",
         "",
         ids,
     )
@@ -309,6 +364,8 @@ pub fn existing_from_row(row: &Value) -> Option<(String, Existing)> {
             status: s("status"),
             comp_only: row.get("comp_only").and_then(Value::as_f64) == Some(1.0),
             detail_read_at: s("detail_read_at"),
+            water_type: s("water_type"),
+            water_body: s("water_body"),
         },
     ))
 }
@@ -321,15 +378,19 @@ fn insert_sql() -> String {
     format!("INSERT OR IGNORE INTO listings ({}) VALUES ({})", cols.join(", "), placeholders(1, cols.len()))
 }
 
-/// The card fields are overwritten, the sticky ones only by a non-null value.
+/// The card fields are overwritten, the sticky ones only by a non-null value,
+/// the water ones by [`water_sets`].
 fn update_sql() -> String {
     let fields: Vec<_> = FIELDS.iter().filter(|f| f.0 != "id").collect();
+    let names: Vec<&str> = fields.iter().map(|f| f.1).collect();
+    let n = fields.len();
     let mut sets: Vec<String> = fields
         .iter()
         .enumerate()
+        .filter(|(_, f)| !WATER.contains(&f.1))
         .map(|(i, (c, _, _, sticky))| if *sticky { format!("{c} = COALESCE(?{}, {c})", i + 1) } else { format!("{c} = ?{}", i + 1) })
         .collect();
-    let n = fields.len();
+    sets.extend(water_sets(&names, Some(n + 5)));
     sets.push(format!("last_seen = MAX(last_seen, ?{})", n + 1));
     sets.push(format!("price_changes = price_changes + ?{}", n + 2));
     sets.push("removed_at = NULL".into());
@@ -414,6 +475,8 @@ impl Planner {
                     comp_only,
                     detail_read_at: detail_at.map(str::to_string),
                     removed: false,
+                    water_type: l["waterType"].as_str().map(str::to_string),
+                    water_body: l["waterBody"].as_str().map(str::to_string),
                 },
             );
             return vec![Stmt::new(self.insert.clone(), params), price_history(&id, seen_at, price as i64)];
@@ -427,7 +490,13 @@ impl Planner {
             (Some(seen), Some(cutoff)) => *seen >= cutoff,
             _ => false,
         };
-        let relevant = price_changed || status_changed || flag_changed || brings_detail || e.removed;
+        // Map water lands only on rows never detail-read (as the UPDATE does).
+        let (wt, wb) = (l["waterType"].as_str(), l["waterBody"].as_str());
+        let map_water_changed = detail_at.is_none()
+            && e.detail_read_at.is_none()
+            && (e.water_type.as_deref(), e.water_body.as_deref()) != (wt, wb);
+        let relevant =
+            price_changed || status_changed || flag_changed || brings_detail || map_water_changed || e.removed;
         if !relevant && recent {
             self.stats.unchanged += 1;
             return Vec::new();
@@ -441,6 +510,7 @@ impl Planner {
             Param::Int(i64::from(price_changed)),
             if fresh { Param::Text(seen_at.into()) } else { Param::Null },
             Param::Text(id.clone()),
+            Param::Int(i64::from(detail_at.is_some())),
         ]);
         let mut out = vec![Stmt::new(self.update.clone(), params)];
         self.stats.updated += 1;
@@ -465,6 +535,8 @@ impl Planner {
                 last_seen: Some(seen_at.into()),
                 status: Some(status.into()),
                 comp_only,
+                water_type: if map_water_changed || (brings_detail && wt.is_some()) { wt.map(str::to_string) } else { e.water_type },
+                water_body: if map_water_changed || (brings_detail && wt.is_some()) { wb.map(str::to_string) } else { e.water_body },
                 detail_read_at: if brings_detail { detail_at.map(str::to_string) } else { e.detail_read_at },
                 removed: false,
             },
@@ -493,8 +565,17 @@ pub struct Detail {
     pub fields: Value,
 }
 
-const DETAIL_FIELDS: [&str; 8] =
-    ["detailReadAt", "description", "waterType", "waterBody", "frontageFt", "maintenance", "taxes", "yearBuilt"];
+const DETAIL_FIELDS: [&str; 9] = [
+    "detailReadAt",
+    "description",
+    "waterType",
+    "waterBody",
+    "waterSource",
+    "frontageFt",
+    "maintenance",
+    "taxes",
+    "yearBuilt",
+];
 
 /// `{"listings": [{id, detailReadAt, description?, waterType?, ...}]}`.
 pub fn parse_details(body: &Value, now: &str) -> Result<Vec<Detail>, String> {
@@ -520,14 +601,22 @@ pub fn parse_details(body: &Value, now: &str) -> Result<Vec<Detail>, String> {
     Ok(out)
 }
 
-/// The UPDATE for one detail result: only non-null values are written.
+/// The UPDATE for one detail result: only non-null values are written, and
+/// a water type replaces the stored water (map or older description) whole.
 pub fn detail_update(d: &Detail) -> Stmt {
     let cols: Vec<(&str, &str, Kind)> = FIELDS
         .iter()
         .filter(|f| DETAIL_FIELDS.contains(&f.1))
         .map(|f| (f.0, f.1, f.2))
         .collect();
-    let sets: Vec<String> = cols.iter().enumerate().map(|(i, (c, _, _))| format!("{c} = COALESCE(?{}, {c})", i + 1)).collect();
+    let names: Vec<&str> = cols.iter().map(|c| c.1).collect();
+    let mut sets: Vec<String> = cols
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, k, _))| !WATER.contains(k))
+        .map(|(i, (c, _, _))| format!("{c} = COALESCE(?{}, {c})", i + 1))
+        .collect();
+    sets.extend(water_sets(&names, None));
     let mut params: Vec<Param> = cols.iter().map(|(_, k, kind)| param(&d.fields, k, *kind)).collect();
     params.push(Param::Text(d.id.clone()));
     Stmt::new(format!("UPDATE listings SET {} WHERE id = ?{}", sets.join(", "), cols.len() + 1), params)
@@ -597,6 +686,47 @@ mod tests {
         .unwrap();
         assert_eq!(l["description"].as_str().unwrap().len(), MAX_DESCRIPTION_CHARS);
         assert!(l["waterType"].is_null(), "unknown water type");
+        assert!(l["waterSource"].is_null(), "no water type, no source");
+    }
+
+    #[test]
+    fn normalize_keeps_map_water_and_sets_the_source() {
+        let mi = |extra: Value| {
+            let mut l = json!({"id": "zl:1", "source": "zillow", "market": "mi", "price": 1});
+            l.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            normalize(&l, &Scope::default()).unwrap()
+        };
+        let l = mi(json!({"waterType": "inland", "waterBody": "Torch Lake", "waterSource": "map", "frontageFt": 100}));
+        assert_eq!((l["waterType"].as_str(), l["waterBody"].as_str(), l["waterSource"].as_str()), (Some("inland"), Some("Torch Lake"), Some("map")));
+        assert!(l["frontageFt"].is_null(), "only water type and body come from the map");
+        let l = mi(json!({"waterType": "lagoon", "waterBody": "X", "waterSource": "map"}));
+        assert!(l["waterType"].is_null() && l["waterBody"].is_null() && l["waterSource"].is_null());
+        let l = mi(json!({"waterType": "inland", "waterSource": "satellite"}));
+        assert!(l["waterType"].is_null() && l["waterSource"].is_null());
+        let l = mi(json!({"waterType": "access", "waterSource": "map", "detailReadAt": T}));
+        assert_eq!(l["waterSource"], "description", "a detail read is always the description");
+    }
+
+    #[test]
+    fn map_water_changes_are_relevant_only_before_a_detail_read() {
+        let card = |t: Option<&str>| {
+            let mut l = nyc("a", 500000, Some(9));
+            if let Some(t) = t {
+                l["waterType"] = json!(t);
+                l["waterBody"] = json!("Torch Lake");
+                l["waterSource"] = json!("map");
+            }
+            l
+        };
+        let mut p = Planner::new(HashMap::from([("a".to_string(), known(500000.0, T))]));
+        assert_eq!(p.plan(&card(Some("inland")), &scope("quick")).len(), 1, "new map water is written");
+        assert!(p.plan(&card(Some("inland")), &scope("quick")).is_empty(), "the same again is not");
+        assert_eq!(p.plan(&card(None), &scope("quick")).len(), 1, "cleared map water is written");
+        let mut e = known(500000.0, T);
+        e.detail_read_at = Some(T.into());
+        e.water_type = Some("access".into());
+        let mut p = Planner::new(HashMap::from([("a".to_string(), e)]));
+        assert!(p.plan(&card(Some("inland")), &scope("quick")).is_empty(), "a read description wins");
     }
 
     #[test]
@@ -653,7 +783,7 @@ mod tests {
         assert_eq!(st.len(), 2);
         assert!(st[0].sql.contains("price_changes = price_changes + ?"));
         assert!(st[0].sql.contains("description = COALESCE(?"));
-        assert!(st[0].sql.contains("water_type = COALESCE(?"));
+        assert!(st[0].sql.contains("water_type = CASE WHEN ?"));
         assert!(st[0].sql.contains("removed_at = NULL"));
         p.plan(&nyc("rise", 550000, Some(30)), &scope("full"));
         p.plan(&nyc("back", 500000, Some(30)), &scope("full"));

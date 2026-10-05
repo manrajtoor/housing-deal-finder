@@ -535,6 +535,9 @@ func (r *runner) parseDetail(market, id, body string) (listing.Detail, error) {
 		d.Description = listing.Str(listing.Truncate(zd.Description, listing.MaxDescription))
 		d.WaterType = listing.Str(zd.Water.Type)
 		d.WaterBody = listing.Str(zd.Water.Body)
+		if d.WaterType != nil {
+			d.WaterSource = listing.Ptr(listing.WaterFromDescription)
+		}
 		d.FrontageFt = zd.Water.FrontageFt
 		d.YearBuilt = zd.YearBuilt
 	}

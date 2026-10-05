@@ -108,6 +108,7 @@ for (let i = 0; i < 34; i++) {
     daysOnMarket: Math.floor(between(2, 200)),
     photoUrl: i % 6 === 4 ? null : `dev/fixtures/photos/mi-${(i % 3) + 1}.svg`,
     waterType, waterBody: body,
+    waterSource: waterType == null ? null : (waterType === 'great_lakes' || waterType === 'inland') && i % 3 === 0 ? 'map' : 'description',
     frontageFt: waterType === 'access' || waterType == null || rnd() < 0.25 ? null : round(between(50, 260), 5),
     baseline, discountPct: Math.round(((baseline - price) / baseline) * 1000) / 10, basis: 'ppsf',
     group: thin ? `All six counties · ${waterType ?? 'other'}` : `${area === 'traverse' ? 'Traverse' : 'Petoskey'} · ${(waterType ?? 'other').replace('_', ' ')}`,

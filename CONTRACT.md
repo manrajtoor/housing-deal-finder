@@ -32,12 +32,13 @@ All money is whole US dollars, all times ISO-8601 UTC strings.
 | `daysOnMarket` | int? | As the site reports it when crawled. |
 | `photoUrl` | string? | First photo. |
 | `description` | string? | Up to 3 000 chars. Michigan detail pages; omitted when not read. |
-| `waterType` | string? | Michigan: `great_lakes` `inland` `access` `other`. Null until the detail page is read. |
+| `waterType` | string? | Michigan: `great_lakes` `inland` `access` `other`. From the map on a search card (`great_lakes` / `inland` only) or the description. Null when neither says. |
 | `waterBody` | string? | E.g. `Torch Lake`, `West Grand Traverse Bay`. |
+| `waterSource` | string? | `map` (search card: OpenStreetMap geography from `lat`/`lon`, crawler/internal/geo) or `description` (detail page). A card's water is accepted only with `waterSource: "map"` and stored only while the row's `detailReadAt` is null; a detail read that names a water type replaces type, body and source; one that names none keeps them. |
 | `frontageFt` | int? | Private frontage in feet, when the description states it. |
 | `maintenance` | int? | NYC monthly co-op maintenance or condo common charges. |
 | `taxes` | int? | NYC monthly taxes. |
-| `detailReadAt` | string? | Set when the detail page was read. Omitted fields with a null `detailReadAt` must not wipe stored detail fields. |
+| `detailReadAt` | string? | Set when the detail page was read. Omitted fields with a null `detailReadAt` must not wipe stored detail fields (map water aside, see `waterSource`). |
 | `compOnly` | bool | True for listings the crawler knows are old (sold rows, back pages of a first load). Never fresh, never alerts. |
 
 ## Worker HTTP API (`housedeals-api`)
@@ -52,8 +53,9 @@ Crawler routes need `Authorization: Bearer <INGEST_TOKEN>`.
 - `POST /api/listings/needs-detail` body `{"market":"mi"|"nyc","limit":N}` → `{"ids":[…], "urls":[…]}`:
   - Michigan: active listings whose `detailReadAt` is null.
   - NYC: active listings ≤ $900k whose stored score (written by the crawl job) is ≥ 10% under baseline and whose `detailReadAt` is null.
-- `POST /api/listings/detail` body `{"listings":[{id, detailReadAt, description?, waterType?, waterBody?, frontageFt?, maintenance?, taxes?, yearBuilt?}]}` → `{"updated","unknown","scored":0,"newAlerts":0,"rowsWritten"}`. Stores only.
-- `GET /api/score-input?market=nyc|mi&after=<id>&limit=<≤1000>` → `{"market","columns":[…],"rows":[[…]…],"last","n"}`:
+- `POST /api/listings/detail` body `{"listings":[{id, detailReadAt, description?, waterType?, waterBody?, waterSource?, frontageFt?, maintenance?, taxes?, yearBuilt?}]}`
+  (the crawler sends ≤ 10 a request; the Worker sets `waterSource` to `description` whenever `waterType` is given) → `{"updated","unknown","scored":0,"newAlerts":0,"rowsWritten"}`. Stores only.
+- `GET /api/score-input?market=nyc|mi&after=<id>&limit=<≤1000>` (the crawler asks 500) → `{"market","columns":[…],"rows":[[…]…],"last","n"}`:
   one page, by id, of the market's active unremoved listings and homes sold in the last 365 days.
   Each row is an array in `columns` order: the Deal's listing fields, `status soldAt removedAt compOnly freshAt detailReadAt`,
   and the stored score `storedDiscount storedAlert storedPrice scoredAt` (null when none). The next page asks `after=<last>`;
@@ -80,7 +82,7 @@ Reads `{"market","now","columns","rows"}` (the score-input pages joined) on stdi
 
 ## Deal (scorer output, stored in `listing_scores.deal` as JSON)
 
-Listing fields shown on the dashboard (`id url address unit city neighborhood borough county area price beds baths sqft lotSqft homeType zestimate daysOnMarket photoUrl waterType waterBody frontageFt maintenance taxes`) plus:
+Listing fields shown on the dashboard (`id url address unit city neighborhood borough county area price beds baths sqft lotSqft homeType zestimate daysOnMarket photoUrl waterType waterBody waterSource frontageFt maintenance taxes`) plus:
 
 | Field | Notes |
 |---|---|

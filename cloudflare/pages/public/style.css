@@ -124,6 +124,7 @@ section { margin-top: 20px; }
   display: inline-block; font-size: .8rem; font-weight: 650; padding: 2px 8px; border-radius: 99px;
   font-variant-numeric: tabular-nums; background: var(--d4-bg); color: var(--d4);
 }
+.water-src { font-size: .72rem; font-style: italic; }
 .badge { display: inline-block; font-size: .72rem; font-weight: 600; padding: 1px 7px; border-radius: 99px; white-space: nowrap; }
 .badge.great_lakes { color: var(--gl); background: var(--gl-bg); }
 .badge.inland { color: var(--in); background: var(--in-bg); }

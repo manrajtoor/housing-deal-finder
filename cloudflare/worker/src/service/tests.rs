@@ -19,6 +19,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../../d1/migrations/0001_init.sql"),
     include_str!("../../../d1/migrations/0002_needs_detail_sold.sql"),
     include_str!("../../../d1/migrations/0003_score_input.sql"),
+    include_str!("../../../d1/migrations/0004_water_source.sql"),
 ];
 
 /// The store's futures never wait on anything, so one poll finishes them.
@@ -416,6 +417,74 @@ fn michigan_detail_reads_are_stored_sticky_and_alert_fresh_listings() {
     assert_eq!(row["frontage_ft"], 90.0);
     assert_eq!(row["description"], "On Elk Lake");
     assert_eq!(row["detail_read_at"], LATER);
+}
+
+fn water(db: &Db, id: &str) -> (Value, Value, Value) {
+    let r = db.one(&format!("SELECT water_type, water_body, water_source FROM listings WHERE id = '{id}'"));
+    (r["water_type"].clone(), r["water_body"].clone(), r["water_source"].clone())
+}
+
+#[test]
+fn map_water_from_cards_is_stored_until_a_description_is_read() {
+    let db = Db::new();
+    let map = |id: &str, t: &str, b: &str| {
+        let mut h = house(id, "traverse", 700_000, 5);
+        h["waterType"] = json!(t);
+        h["waterBody"] = json!(b);
+        h["waterSource"] = json!("map");
+        h
+    };
+    let s = |v: &str| json!(v);
+    // Six map-inland comps and a cheap fresh map-inland listing: map water prices and alerts.
+    let comps: Vec<Value> = (0..6).map(|i| map(&format!("zl:{i}"), "inland", "Torch Lake")).collect();
+    push(&db, comps, "mi", "full", NOW);
+    let mut cheap = map("zl:cheap", "inland", "Elk Lake");
+    cheap["price"] = json!(550_000);
+    cheap["daysOnMarket"] = json!(1);
+    push(&db, vec![cheap], "mi", "quick", LATER);
+    assert_eq!(water(&db, "zl:cheap"), (s("inland"), s("Elk Lake"), s("map")));
+    let j = job(&db, "mi", LATER);
+    assert_eq!(j.stored.new_alerts, 1, "map-derived inland counts for the alert rule");
+    let a = alerts_json(&db, &[("market", "mi")]);
+    assert_eq!((a["alerts"][0]["waterBody"].as_str(), a["alerts"][0]["waterSource"].as_str()), (Some("Elk Lake"), Some("map")));
+    // A card without the map's blessing ("waterSource" missing) carries no water.
+    let mut bare = house("zl:bare", "traverse", 700_000, 5);
+    bare["waterType"] = json!("inland");
+    push(&db, vec![bare], "mi", "full", NOW);
+    assert_eq!(water(&db, "zl:bare"), (Value::Null, Value::Null, Value::Null));
+
+    // A changed map classification on a never-read row is written right away (not a 20 h touch)...
+    let r = push(&db, vec![map("zl:0", "great_lakes", "West Grand Traverse Bay")], "mi", "full", LATER);
+    assert_eq!(r.stats.updated, 1);
+    assert_eq!(water(&db, "zl:0"), (s("great_lakes"), s("West Grand Traverse Bay"), s("map")));
+    // ...and an unchanged one writes nothing.
+    let before = db.writes().len();
+    push(&db, vec![map("zl:0", "great_lakes", "West Grand Traverse Bay")], "mi", "full", LATER);
+    assert_eq!(db.writes().len() - before, 1, "only the crawls row");
+    // The map no longer placing it on water clears the map value.
+    push(&db, vec![house("zl:1", "traverse", 700_000, 5)], "mi", "full", LATER);
+    assert_eq!(water(&db, "zl:1"), (Value::Null, Value::Null, Value::Null));
+
+    // A description wins: type, body and source replaced whole (body may be null)...
+    post_detail(&db, json!([{"id": "zl:cheap", "detailReadAt": LATER, "waterType": "access", "description": "Deeded access"}]), LATER);
+    assert_eq!(water(&db, "zl:cheap"), (s("access"), Value::Null, s("description")));
+    // ...and later map cards never overwrite it.
+    let mut again = map("zl:cheap", "inland", "Elk Lake");
+    again["price"] = json!(550_000);
+    push(&db, vec![again], "mi", "full", "2026-10-07T12:00:00.000Z");
+    assert_eq!(water(&db, "zl:cheap"), (s("access"), Value::Null, s("description")));
+    // A description that names no water keeps the map's value, and the map stops updating it.
+    post_detail(&db, json!([{"id": "zl:2", "detailReadAt": LATER, "description": "Nice house"}]), LATER);
+    assert_eq!(water(&db, "zl:2"), (s("inland"), s("Torch Lake"), s("map")));
+    push(&db, vec![map("zl:2", "great_lakes", "Lake Michigan")], "mi", "full", "2026-10-07T12:00:00.000Z");
+    assert_eq!(water(&db, "zl:2"), (s("inland"), s("Torch Lake"), s("map")));
+    // A listing push that carries its own detail read behaves like a detail post.
+    let mut d = map("zl:3", "great_lakes", "Lake Michigan");
+    d["detailReadAt"] = json!(LATER);
+    d["waterType"] = json!("other");
+    d["waterBody"] = json!("Boardman River");
+    push(&db, vec![d], "mi", "full", LATER);
+    assert_eq!(water(&db, "zl:3"), (s("other"), s("Boardman River"), s("description")));
 }
 
 #[test]

@@ -185,6 +185,23 @@ func TestNeedsDetailAndPushDetails(t *testing.T) {
 	if _, ok := d1["waterType"]; ok || d1["maintenance"] != float64(1500) {
 		t.Errorf("detail 1 = %v", d1)
 	}
+
+	// Detail posts go in chunks of at most DetailBatchSize.
+	many := make([]listing.Detail, 23)
+	for i := range many {
+		many[i] = listing.Detail{ID: fmt.Sprintf("zl:%d", i), DetailReadAt: "2026-10-05T12:00:00Z"}
+	}
+	before := len(*calls)
+	if ds, err := c.PushDetails(context.Background(), many); err != nil || ds.Updated != 23 {
+		t.Fatalf("23 details = %+v, %v", ds, err)
+	}
+	var sizes []int
+	for _, call := range (*calls)[before:] {
+		sizes = append(sizes, len(call.body["listings"].([]any)))
+	}
+	if fmt.Sprint(sizes) != "[10 10 3]" {
+		t.Errorf("detail chunk sizes = %v, want [10 10 3]", sizes)
+	}
 }
 
 func TestNew(t *testing.T) {

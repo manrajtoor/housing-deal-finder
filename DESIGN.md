@@ -26,7 +26,8 @@ just bind values and pass JSON strings through.
 |---|---|---|
 | StreetEasy search pages | NYC listings | Data in the Next.js RSC payload: id, areaName, bedroomCount, buildingType, livingAreaSize, price. ~86 a page. |
 | Zillow search pages | Michigan listings, active and sold | `__NEXT_DATA__` → `cat1.searchResults.listResults`, 41 a page. County regions + `isWaterfront`. |
-| Zillow detail pages | Michigan water facts | Only the description says which lake, how many feet and whether the frontage is private or shared, so it is parsed once per listing. |
+| Zillow detail pages | Michigan water facts (when readable) | Only the description says which lake, how many feet and whether the frontage is private or shared, so it is parsed once per listing. Since 2026-10 Zillow answers 403 to runners on detail pages (search pages still work), so the map below is the usual source. |
+| OpenStreetMap (offline, embedded) | Michigan water type from lat/lon | Great Lakes shore and named inland lakes, © OpenStreetMap contributors, ODbL. See "Water from the map". |
 
 Redfin, Realtor.com, Homes.com, LandWatch and Compass block GitHub's runners.
 Craigslist (thin and noisy) and NYC DOF sold prices (no sq ft or beds for
@@ -60,7 +61,9 @@ Without sq ft (common for co-ops), the median asking price of the same group
 is used instead. Co-op maintenance is not on search cards; it is fetched from
 the detail page for alert candidates only and shown next to the alert.
 
-**Michigan.** Water facts come from the description: `great_lakes` (Lake
+**Michigan.** Water facts come from the map at search time (below) and,
+when a detail page can be read, from the description, which then wins:
+`great_lakes` (Lake
 Michigan and its bays: Grand Traverse, West/East Bay, Little Traverse,
 Suttons), `inland` (Torch, Elk, Glen, Leelanau, Crystal, Walloon, Charlevoix,
 Burt, Crooked, …), `access` (shared/deeded/association access: never alerts),
@@ -70,14 +73,53 @@ of living area × sq ft. Groups:
 1. area × water type
 2. all six counties × water type (thin)
 
+**Water from the map.** Every Zillow search card has latitude/longitude. The
+crawler classifies it offline (`crawler/internal/geo`, data embedded as
+`water.json.gz`, ~170 kB): within **90 m** of the Lake Michigan / Lake Huron
+shore (mainland or island) → `great_lakes` (body: a bay such as Suttons Bay,
+West/East Grand Traverse Bay, Little Traverse Bay when one applies, else the
+lake), within 90 m of a named inland lake of ≥ 10 ha (inside counts as 0 m) →
+`inland` with the lake's name, whichever is nearer; otherwise no water type.
+The card then carries `waterSource: "map"`. The Worker stores map water only
+while the row has no detail read; a description that names water replaces it
+whole (`waterSource: "description"`) and is never overwritten by the map. The
+map cannot tell private frontage from shared access or across-the-road
+homes, so map water is a little looser than the description; the alert rule
+still counts it (`great_lakes` / `inland`), since without it Michigan could
+not alert at all while detail pages are blocked. The dashboard marks each
+water badge "map" or "listing".
+
+Data: OpenStreetMap via the Overpass API, built once by
+`tools/geo/build_water.py` (the Great Lakes are `natural=water` relations in
+OSM, not `natural=coastline`; their member ways in the six counties' bbox
+are the shore), simplified to ~10 m. **© OpenStreetMap contributors, ODbL
+1.0** (https://www.openstreetmap.org/copyright).
+
+Threshold, tuned on the 248 live Michigan rows (2026-10-05, all
+waterfront-filtered by Zillow, none with a description read yet): distance
+to the nearest water piles up at 10-60 m (103 rows), stays above the
+background to ~90 m, then is flat (~0.4 rows per metre from 90 to 200 m:
+homes near, not on, the water). Counts by threshold:
+
+| Threshold | great_lakes | inland | none |
+|---|---|---|---|
+| 60 m | 17 | 86 | 145 |
+| 90 m (chosen) | 23 | 102 | 123 |
+| 120 m | 28 | 110 | 110 |
+| 200 m | 33 | 137 | 78 |
+
+The rest are rivers, ponds under 10 ha, unnamed lakes or bad geocodes. The
+one fixture with a read description (10 Island View Dr, "200 feet of private
+frontage on Island Lake") agrees with the map.
+
 Comps are active listings plus homes sold in the last 12 months. The sold ones
 use their sale price, which tends to sit a little under asking, so the
 baseline is conservative and alerts lean toward fewer false positives.
 
 **Alert rule:** ≥ 15% under baseline, ≥ 6 comps (Michigan) or ≥ 8 (NYC), not
 thin, price ≤ $900k, discount ≤ 50% (bigger means bad data), and in
-Michigan only read `great_lakes` or `inland` frontage (unread, `other` and
-`access` listings are scored but never alert).
+Michigan only `great_lakes` or `inland` water, from the description or the
+map (unknown, `other` and `access` listings are scored but never alert).
 The Zestimate is shown next to the alert as a second opinion, never used in
 the score. The rule's numbers are `housedeals-score` flags with these
 defaults. A listing alerts only while fresh: the Worker records `fresh_at`
@@ -101,6 +143,11 @@ listings.
 - Weekly: Michigan sold comps, then Michigan scoring.
 
 ## D1 budget
+
+The crawler reads score-input in pages of 500 rows and posts detail reads in
+chunks of at most 10, to keep each Worker request's CPU small. Map water adds
+no reads: ingest's existing per-batch lookup also returns the stored water.
+
 
 ~6 000 NYC + ~500 Michigan rows. Unchanged rows are not rewritten; `last_seen`
 is refreshed only every 20 h, so a daily sweep touches each row about once a

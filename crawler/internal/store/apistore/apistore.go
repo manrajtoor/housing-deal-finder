@@ -31,8 +31,13 @@ const (
 	ScoresPath      = "/api/scores"
 )
 
-// ScoreInputPageSize is the most rows the Worker returns per score-input page.
-const ScoreInputPageSize = 1000
+// ScoreInputPageSize is how many rows the crawler asks per score-input page
+// (the Worker allows 1000; 500 keeps each request's CPU well under budget).
+const ScoreInputPageSize = 500
+
+// DetailBatchSize is the most detail results one POST /api/listings/detail
+// carries: each is an UPDATE, kept few per request for the Worker's CPU.
+const DetailBatchSize = 10
 
 // maxAnswerBytes caps a Worker answer (a score-input page is ~400 kB).
 const maxAnswerBytes = 16 << 20
@@ -220,7 +225,7 @@ func (c *Client) NeedsDetail(ctx context.Context, market string, limit int) (Nee
 // PushDetails posts detail reads in batches.
 func (c *Client) PushDetails(ctx context.Context, details []listing.Detail) (DetailStats, error) {
 	var total DetailStats
-	size := c.batchSize()
+	size := min(c.batchSize(), DetailBatchSize)
 	for start := 0; start < len(details); start += size {
 		end := min(start+size, len(details))
 		var s DetailStats

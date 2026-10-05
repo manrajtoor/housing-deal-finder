@@ -155,7 +155,7 @@ func TestQuickPushesEverySearchThenReadsDetails(t *testing.T) {
 	if se.ID != "se:1851487" || deref(se.Maintenance) != 3108 || se.Taxes != nil || se.DetailReadAt != "2026-10-05T12:00:00Z" {
 		t.Errorf("streeteasy detail = %+v", se)
 	}
-	if zl.ID != "zl:94778208" || deref(zl.WaterType) != "inland" || deref(zl.WaterBody) != "Island Lake" ||
+	if zl.ID != "zl:94778208" || deref(zl.WaterType) != "inland" || deref(zl.WaterBody) != "Island Lake" || deref(zl.WaterSource) != "description" ||
 		deref(zl.FrontageFt) != 200 || deref(zl.YearBuilt) != 1988 || !strings.HasPrefix(deref(zl.Description), "Welcome") {
 		t.Errorf("zillow detail = %+v", zl)
 	}

@@ -118,6 +118,11 @@ func TestParseSearch(t *testing.T) {
 		{"lat", deref(l.Lat), 44.68526},
 		{"lon", deref(l.Lon), -85.44109},
 		{"compOnly", l.CompOnly, false},
+		// From the map (crawler/internal/geo); the fixture's detail page
+		// agrees: "200 feet of private water frontage ... on Island Lake".
+		{"waterType", deref(l.WaterType), "inland"},
+		{"waterBody", deref(l.WaterBody), "Island Lake"},
+		{"waterSource", deref(l.WaterSource), "map"},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -127,12 +132,22 @@ func TestParseSearch(t *testing.T) {
 	if l.PhotoURL == nil || !strings.HasPrefix(*l.PhotoURL, "https://photos.zillowstatic.com/") {
 		t.Errorf("photo = %v", l.PhotoURL)
 	}
-	if l.SoldAt != nil || l.WaterType != nil || l.Description != nil || l.DetailReadAt != nil {
+	if l.SoldAt != nil || l.FrontageFt != nil || l.Description != nil || l.DetailReadAt != nil {
 		t.Error("a search listing must not carry sold or detail fields")
 	}
 	types := map[string]int{}
+	water := map[string]int{}
 	for _, l := range p.Listings {
 		types[l.HomeType]++
+		water[deref(l.WaterType)]++
+		if (l.WaterType == nil) != (l.WaterSource == nil) {
+			t.Errorf("%s: waterType %v with waterSource %v", l.ID, l.WaterType, l.WaterSource)
+		}
+	}
+	// 274 Bass Lake Rd is on Bass Lake, 1995 N US-31 on East Bay; the other
+	// three are 150-300 m from any lake.
+	if water["inland"] != 2 || water["great_lakes"] != 1 || water[""] != 3 {
+		t.Errorf("water types = %v", water)
 	}
 	if types["condo"] != 1 || types["single_family"] != 5 {
 		t.Errorf("home types = %v", types)

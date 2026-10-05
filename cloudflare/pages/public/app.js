@@ -248,6 +248,8 @@ const COLUMNS = {
         const td = el('td', 'wrap');
         td.append(waterBadge(d.waterType));
         if (d.waterBody) td.append(' ', el('span', null, d.waterBody));
+        const src = waterSourceNote(d);
+        if (src) td.append(' ', src);
         const sub = [d.address, d.city].filter(Boolean).join(', ');
         if (sub) td.append(el('span', 'small', sub));
         return td;
@@ -267,6 +269,18 @@ function waterBadge(type) {
   const t = type || 'unknown';
   const b = el('span', `badge ${LABELS.waterType[t] ? t : 'other'}`, label('waterType', t));
   return b;
+}
+
+// "map" (OpenStreetMap geography: the home is within ~90 m of that water) or
+// "listing" (read from the description). Text only.
+function waterSourceNote(d) {
+  if (!d.waterType || (d.waterSource !== 'map' && d.waterSource !== 'description')) return null;
+  const map = d.waterSource === 'map';
+  const s = el('span', 'water-src muted', map ? 'map' : 'listing');
+  s.title = map
+    ? 'From the map (OpenStreetMap): the home sits by this water. Frontage and access are not known until the listing is read.'
+    : 'From the listing description.';
+  return s;
 }
 
 // ---------- filters ----------
@@ -422,6 +436,8 @@ function card(d) {
     const w = el('div', 'water');
     w.append(waterBadge(d.waterType));
     if (d.waterBody) w.append(el('span', null, d.waterBody));
+    const src = waterSourceNote(d);
+    if (src) w.append(src);
     if (isNum(d.frontageFt)) w.append(el('span', 'muted', `${int(d.frontageFt)} ft frontage`));
     body.append(w);
   }

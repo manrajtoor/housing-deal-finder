@@ -107,10 +107,10 @@ impl Facts {
 
 /// Listing fields a Deal carries (CONTRACT.md "Deal"), plus `market` and
 /// `status` so a reader never has to guess.
-pub const DEAL_FIELDS: [&str; 26] = [
+pub const DEAL_FIELDS: [&str; 27] = [
     "id", "market", "status", "url", "address", "unit", "city", "neighborhood", "borough", "county", "area",
     "price", "beds", "baths", "sqft", "lotSqft", "homeType", "zestimate", "daysOnMarket", "photoUrl",
-    "waterType", "waterBody", "frontageFt", "maintenance", "taxes", "compOnly",
+    "waterType", "waterBody", "waterSource", "frontageFt", "maintenance", "taxes", "compOnly",
 ];
 
 /// The listing part of a Deal: every [`DEAL_FIELDS`] key, null when absent.

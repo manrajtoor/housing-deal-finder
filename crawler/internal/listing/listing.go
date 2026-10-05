@@ -58,11 +58,16 @@ type Listing struct {
 	DaysOnMarket *int    `json:"daysOnMarket,omitempty"`
 	PhotoURL     *string `json:"photoUrl,omitempty"`
 
+	// Water facts. A Michigan search card sets WaterType/WaterBody from the
+	// map (WaterSource "map", crawler/internal/geo); the Worker stores them
+	// only while the row has no detail read, so a description always wins.
+	WaterType   *string `json:"waterType,omitempty"`
+	WaterBody   *string `json:"waterBody,omitempty"`
+	WaterSource *string `json:"waterSource,omitempty"`
+
 	// Detail fields: search pages never set these, so a search push cannot
 	// wipe what an earlier detail read stored.
 	Description  *string `json:"description,omitempty"`
-	WaterType    *string `json:"waterType,omitempty"`
-	WaterBody    *string `json:"waterBody,omitempty"`
 	FrontageFt   *int    `json:"frontageFt,omitempty"`
 	Maintenance  *int    `json:"maintenance,omitempty"`
 	Taxes        *int    `json:"taxes,omitempty"`
@@ -78,11 +83,18 @@ type Detail struct {
 	Description  *string `json:"description,omitempty"`
 	WaterType    *string `json:"waterType,omitempty"`
 	WaterBody    *string `json:"waterBody,omitempty"`
+	WaterSource  *string `json:"waterSource,omitempty"` // "description" when WaterType is set
 	FrontageFt   *int    `json:"frontageFt,omitempty"`
 	Maintenance  *int    `json:"maintenance,omitempty"`
 	Taxes        *int    `json:"taxes,omitempty"`
 	YearBuilt    *int    `json:"yearBuilt,omitempty"`
 }
+
+// Water sources (CONTRACT.md waterSource).
+const (
+	WaterFromMap         = "map"
+	WaterFromDescription = "description"
+)
 
 // MaxDescription is the contract's cap on description length (characters).
 const MaxDescription = 3000

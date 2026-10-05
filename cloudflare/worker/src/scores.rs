@@ -72,7 +72,7 @@ impl ScoreInputQuery {
 
 /// (name in the output, column of the page subquery, expression in json_array).
 /// Names are the contract's camelCase fields, plus the stored score.
-pub const INPUT_COLUMNS: [(&str, &str, &str); 33] = [
+pub const INPUT_COLUMNS: [(&str, &str, &str); 34] = [
     ("id", "l.id", "id"),
     ("url", "l.url", "url"),
     ("address", "l.address", "address"),
@@ -93,6 +93,7 @@ pub const INPUT_COLUMNS: [(&str, &str, &str); 33] = [
     ("photoUrl", "l.photo_url", "photo_url"),
     ("waterType", "l.water_type", "water_type"),
     ("waterBody", "l.water_body", "water_body"),
+    ("waterSource", "l.water_source", "water_source"),
     ("frontageFt", "l.frontage_ft", "frontage_ft"),
     ("maintenance", "l.maintenance", "maintenance"),
     ("taxes", "l.taxes", "taxes"),
