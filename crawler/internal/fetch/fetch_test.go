@@ -146,3 +146,14 @@ func TestThrottleSpacesCalls(t *testing.T) {
 		t.Errorf("slept = %v", slept)
 	}
 }
+
+func TestNoRetry429(t *testing.T) {
+	url, hits := serve(t, func(w http.ResponseWriter, _ *http.Request, _ int) { w.WriteHeader(429) })
+	f := fetcher()
+	f.NoRetry429 = func(u string) bool { return u == url }
+	_, err := f.Fetch(context.Background(), url)
+	var h *HTTPError
+	if !errors.As(err, &h) || h.Status != 429 || atomic.LoadInt32(hits) != 1 {
+		t.Errorf("err %v, hits %d: want one 429, not retried", err, atomic.LoadInt32(hits))
+	}
+}

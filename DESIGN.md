@@ -35,13 +35,22 @@ units) are possible later additions. NYC sold prices come from Zillow (see
 "NYC sold comps").
 
 Zillow Group's terms forbid automated access. The owner accepted that: crawls
-stay small (1.5 s between requests, 6 s between detail pages, one process),
+stay small (1.5 s between requests, 6 s between detail pages, 8 s between
+Zillow search pages in sold mode, one process),
 are for personal use only, and nothing is republished; the dashboard sits
 behind Access. Zillow answered 403 after 14 detail pages 1.5 s apart, so a
 run reads at most 6 (quick) or 20 (full) detail pages per market, and a
 blocked detail page ends that market's detail reads for the run with a
-warning, not a failed run. The weekly NYC sold crawl makes at most 150
-requests (~110 on 2026-10-07); past that it stops with a warning.
+warning, not a failed run. Search pages have a limit of their own from
+GitHub's runners (a local run read 109 in a row): on 2026-10-07 a sold run
+got 429 after ~22 Zillow search pages 1.5 s apart, and every Zillow page
+after it too. So a sold run makes at most 25 Zillow requests
+(`--sold-budget`), 8 s apart; quick and full runs read only ~7-10 Zillow
+pages at the normal 1.5 s. Zillow answering 403, 429 or a bot check ends
+every Zillow request of the run (searches and detail pages) with a warning,
+and the run still exits 0: it is expected now and then, and the next run
+tries again. The fetcher does not retry Zillow's 429 (a retry only counts
+against us).
 
 ## Comps go above the alert ceiling
 
@@ -170,15 +179,27 @@ markets). The sold ones use their sale price, which tends to sit a little
 under asking, so the baseline is conservative and alerts lean toward fewer
 false positives. Sold rows are never subjects.
 
-**NYC sold comps.** The weekly `sold` crawl reads Zillow's recently-sold
+**NYC sold comps.** The daily `sold` crawl reads Zillow's recently-sold
 search per borough (Manhattan 12530, Brooklyn 37607, Queens 270915, Bronx
 17182, Staten Island 27252, region type 17), 2+ beds, no houses, townhouses,
-multi-family, land or manufactured homes, up to $1.5M, split into price bands
-of ≤ 780 results the way StreetEasy's full sweep is (Zillow serves 20 pages
-of 41). The window is 6 months (`--sold-window`): 12 months is ~7 900 sales,
-~200 pages, over the 150-request budget, and sold rows stay in D1 (score-input
-keeps those sold in the last 365 days), so weekly 6-month windows hold a full
-year after six months. Rows: `zl:<zpid>`, `status: sold`, `compOnly`,
+multi-family, land or manufactured homes, up to $1.5M, in price bands. The
+window is 6 months (`--sold-window`): ~4 000 sales, ~105 pages on
+2026-10-07, against the ~11 Zillow requests a day left after Michigan's ~14
+(budget 25). So the window is cut into 14 fixed slots, (borough, price band)
+searches of ~5-11 pages each (`zillow.NYCSoldSlots`, boroughs taking turns),
+and each run walks them in order from slot (UTC day number mod 14) until the
+budget is spent: about one slot a day, so every slot is read every 14 days,
+Manhattan, Brooklyn and Queens every 3-4 days, the Bronx and Staten Island
+(one slot each) every 14. No cursor is kept anywhere; a run that stops
+early (budget, 429) just leaves the rest to the slots' next turn. Results
+are most recent first, so even a slot cut short reads its newest sales, and
+a slot gains far less than a page of sales in 14 days. A slot that grows
+past 780 results is still split in two the way StreetEasy's full sweep is
+(Zillow serves 20 pages of 41). Sold rows stay in D1 (score-input keeps
+those sold in the last 365 days), so 6-month windows hold a full year after
+six months. A one-off backfill can walk every slot from a machine Zillow
+does not limit as hard: `housedeals --mode sold --market nyc --sold-budget
+150 --push …` (8 s apart, ~15 min). Rows: `zl:<zpid>`, `status: sold`, `compOnly`,
 `soldAt`, address without the unit (the unit goes to `unit`), borough from
 the ZIP, no neighbourhood. Sales under $100k (transfers, parking, typos) and
 undisclosed addresses are dropped.
@@ -282,8 +303,9 @@ listings.
 - Daily 11:00 UTC: full sweep of every page (keeps `last_seen` honest), up to
   20 detail pages per market, scoring, plus expiry of listings unseen for
   3 days.
-- Weekly: Michigan sold comps (12 months) and NYC sold comps (6 months,
-  ≤ 150 requests), then scoring of both.
+- Daily 13:15 UTC (between the quick runs, away from the 11:00 sweep):
+  Michigan sold comps (12 months), then the day's NYC sold slots (6 months,
+  ≤ 25 Zillow requests in all, 8 s apart), then scoring of both.
 
 ## D1 budget
 

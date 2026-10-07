@@ -4,11 +4,14 @@
 //
 // Every request goes through the one Fetcher it is given (the CLI wraps a
 // single 1.5 s Throttle around it); detail pages are also spaced by
-// DetailDelay. A source stops at its first error that survived the
-// fetcher's retries (a 403, a bot-check page, a page that changed shape);
+// DetailDelay, and in sold mode Zillow search pages by ZillowDelay, within a
+// budget of SoldBudget Zillow requests. A source stops at its first error
+// that survived the fetcher's retries (a 404, a page that changed shape);
 // what it gathered before is still pushed, and Run reports the failure so
-// the CLI exits non-zero. A detail page that is blocked (403, 429, a bot
-// check) only stops that market's detail reads, with a warning.
+// the CLI exits non-zero. Being blocked is not a failure: a Zillow page that
+// answers 403 / 429 or a bot check ends every Zillow request of the run
+// (search and detail) with a warning, and a blocked StreetEasy detail page
+// ends NYC's detail reads with a warning.
 package crawl
 
 import (
@@ -74,9 +77,16 @@ type Config struct {
 	SoldWindow string
 	// DetailDelay spaces detail pages, on top of the Fetcher's own throttle.
 	DetailDelay time.Duration
-	Out         io.Writer
-	Log         *log.Logger
-	Now         func() time.Time
+	// ZillowDelay spaces Zillow search pages in sold mode, on top of the
+	// Fetcher's own throttle (quick and full read ~7-10 Zillow pages and
+	// keep the Fetcher's spacing).
+	ZillowDelay time.Duration
+	// SoldBudget is the most Zillow requests a sold run makes, Michigan
+	// first, then NYC (NYCSoldSlots); 0 means DefaultSoldBudget.
+	SoldBudget int
+	Out        io.Writer
+	Log        *log.Logger
+	Now        func() time.Time
 }
 
 // DefaultMaxPages is the per-search page cap of each mode.
@@ -114,7 +124,14 @@ type runner struct {
 	res    Result
 	// detail fetches pages through an extra DetailDelay throttle.
 	detail fetch.Fetcher
+	// zl fetches every Zillow search page.
+	zl *zillowGate
 }
+
+// DefaultSoldBudget is the sold run's Zillow request budget. From a GitHub
+// runner Zillow answered 429 after ~22 search pages in under a minute
+// (2026-10-07); Michigan sold takes ~14, leaving ~11 for NYC.
+const DefaultSoldBudget = 25
 
 // Run crawls. It returns what it gathered; Failures lists the errors that
 // stopped a source, a push or a detail read.
@@ -135,21 +152,40 @@ func Run(ctx context.Context, cfg Config) Result {
 	if cfg.DetailDelay > 0 {
 		r.detail = fetch.NewThrottle(cfg.DetailDelay).Wrap(cfg.Fetcher)
 	}
+	r.zl = &zillowGate{f: cfg.Fetcher, budget: -1}
+	if cfg.Mode == ModeSold {
+		if cfg.ZillowDelay > 0 {
+			r.zl.f = fetch.NewThrottle(cfg.ZillowDelay).Wrap(cfg.Fetcher)
+		}
+		r.zl.budget = cfg.SoldBudget
+		if r.zl.budget <= 0 {
+			r.zl.budget = DefaultSoldBudget
+		}
+	}
 	r.res.Listings = []listing.Listing{}
 	r.res.Details = []listing.Detail{}
 
 	var crawled []string
-	if r.has(listing.MarketNYC) {
-		if cfg.Mode == ModeSold {
-			r.zillowNYCSold(ctx)
-		} else {
-			r.streetEasy(ctx)
+	if cfg.Mode == ModeSold {
+		// Michigan first: its ~14 pages are the whole market, NYC's
+		// rotation takes what is left of the budget.
+		if r.has(listing.MarketMI) {
+			r.zillow(ctx)
+			crawled = append(crawled, listing.MarketMI)
 		}
-		crawled = append(crawled, listing.MarketNYC)
-	}
-	if r.has(listing.MarketMI) {
-		r.zillow(ctx)
-		crawled = append(crawled, listing.MarketMI)
+		if r.has(listing.MarketNYC) {
+			r.zillowNYCSold(ctx)
+			crawled = append(crawled, listing.MarketNYC)
+		}
+	} else {
+		if r.has(listing.MarketNYC) {
+			r.streetEasy(ctx)
+			crawled = append(crawled, listing.MarketNYC)
+		}
+		if r.has(listing.MarketMI) {
+			r.zillow(ctx)
+			crawled = append(crawled, listing.MarketMI)
+		}
 	}
 	if cfg.Mode != ModeSold && cfg.DetailLimit > 0 {
 		if cfg.API == nil {
@@ -379,65 +415,113 @@ func (r *runner) walkBand(ctx context.Context, b band, seen map[string]bool, par
 	return r.walkBand(ctx, lo, seen, first.totalCount) && r.walkBand(ctx, hi, seen, first.totalCount)
 }
 
-// errBudget: the run's request budget for a source is spent.
-var errBudget = errors.New("request budget spent")
+var (
+	// errBudget: the sold run's Zillow request budget is spent.
+	errBudget = errors.New("request budget spent")
+	// errZillowBlocked: Zillow blocked an earlier request of this run.
+	errZillowBlocked = errors.New("zillow blocked an earlier request of this run")
+)
 
-// budget lets at most left requests through, then answers errBudget.
-type budget struct {
-	f    fetch.Fetcher
-	left int
+// zillowGate is the way every Zillow search page goes: it lets at most
+// budget requests through (budget < 0: no limit) and none once Zillow has
+// blocked one (see stopped).
+type zillowGate struct {
+	f       fetch.Fetcher
+	budget  int
+	used    int
+	blocked error
 }
 
-func (b *budget) Fetch(ctx context.Context, u string) (string, error) {
-	if b.left <= 0 {
+func (g *zillowGate) Fetch(ctx context.Context, u string) (string, error) {
+	if g.blocked != nil {
+		return "", errZillowBlocked
+	}
+	if g.left() == 0 {
 		return "", errBudget
 	}
-	b.left--
-	return b.f.Fetch(ctx, u)
+	g.used++
+	return g.f.Fetch(ctx, u)
 }
 
-// NYCSoldBudget is the most requests one run makes for NYC sold comps
-// (a 6-month window is ~100 pages plus a probe per band split).
-var NYCSoldBudget = 150
+// left is how many requests the budget still allows (-1: no limit).
+func (g *zillowGate) left() int {
+	if g.budget < 0 {
+		return -1
+	}
+	return max(g.budget-g.used, 0)
+}
 
-// zillowNYCSold reads Zillow's recently-sold search for each borough, split
-// into price bands of at most SoldBandLimit results (Zillow serves 20 pages
-// of 41). The rows are comps only: status sold, compOnly, soldAt. Building
-// type and neighbourhood are filled in by the scorer (scorer/src/nyc_sold.rs).
+// SoldSlotStart is the NYCSoldSlots slot a sold run starts at: the UTC day
+// number modulo the slot count, so daily runs move on one slot a day and
+// cycle forever without keeping a cursor anywhere.
+func SoldSlotStart(now time.Time, slots int) int {
+	day := now.UTC().Unix() / 86400
+	return int(day % int64(slots))
+}
+
+// zillowNYCSold reads Zillow's recently-sold search for NYC: the slots of
+// zillow.NYCSoldSlots (borough x price band), from today's SoldSlotStart on,
+// until the run's Zillow budget is spent. A slot reporting more than
+// SoldBandLimit results is split further (Zillow serves 20 pages of 41).
+// The rows are comps only: status sold, compOnly, soldAt. Building type and
+// neighbourhood are filled in by the scorer (scorer/src/nyc_sold.rs).
 func (r *runner) zillowNYCSold(ctx context.Context) {
-	f := &budget{f: r.cfg.Fetcher, left: NYCSoldBudget}
+	if r.zl.blocked != nil {
+		r.cfg.Log.Printf("zillow nyc sold: skipped (Zillow blocked this run)")
+		return
+	}
+	slots := zillow.NYCSoldSlots(r.cfg.SoldWindow)
+	start := SoldSlotStart(r.cfg.Now(), len(slots))
+	r.cfg.Log.Printf("zillow nyc sold: starting at slot %d/%d (%s), %d of %d Zillow requests left",
+		start+1, len(slots), slots[start].Label(), r.zl.left(), r.zl.budget)
 	seen := map[string]bool{}
-	for _, b := range zillow.NYCBoroughs {
+	for i := range slots {
+		if r.zl.left() == 0 {
+			r.cfg.Log.Printf("zillow nyc sold: budget spent after %d slots; the next run starts at the next slot", i)
+			return
+		}
+		k := (start + i) % len(slots)
+		s := slots[k]
 		before := len(r.res.Listings)
-		ok := r.walkBand(ctx, r.zlSoldBand(zillow.NewSoldSearch(b, r.cfg.SoldWindow), f), seen, 0)
-		r.cfg.Log.Printf("zillow nyc sold %s: %d sold rows (window %s), %d of %d requests left",
-			b.Slug, len(r.res.Listings)-before, zillow.NewSoldSearch(b, r.cfg.SoldWindow).Window, f.left, NYCSoldBudget)
+		ok := r.walkBand(ctx, r.zlSoldBand(s, r.zl), seen, 0)
+		r.cfg.Log.Printf("zillow nyc sold slot %d/%d %s: %d sold rows (window %s), %d of %d requests left",
+			k+1, len(slots), s.Label(), len(r.res.Listings)-before, s.Window, r.zl.left(), r.zl.budget)
 		if !ok {
 			return
 		}
 	}
 }
 
-// stopped records why a source stopped at page n: a failure, or a warning
-// when only the run's request budget ran out.
+// stopped records why a source stopped at page n: a failure; a log line
+// when only the sold run's budget ran out; a warning, and no more Zillow
+// requests this run, when Zillow blocked us (403 / 429 / bot check).
 func (r *runner) stopped(name, source string, n int, err error) {
-	if errors.Is(err, errBudget) {
-		r.cfg.Log.Printf("WARNING %s: stopping %s at page %d: %v (the rest waits for the next run)", name, source, n, err)
-		return
+	switch {
+	case errors.Is(err, errBudget):
+		r.cfg.Log.Printf("%s: stopping %s at page %d: %v (the rest waits for the next run)", name, source, n, err)
+	case errors.Is(err, errZillowBlocked):
+		r.cfg.Log.Printf("%s: skipped (Zillow blocked this run)", name)
+	case source == listing.SourceZillow && blocked(err):
+		r.zl.blocked = err
+		r.cfg.Log.Printf("WARNING %s: Zillow is blocking us at page %d: %v; no more Zillow requests this run", name, n, err)
+	default:
+		r.fail("%s: stopping %s at page %d: %v", name, source, n, err)
 	}
-	r.fail("%s: stopping %s at page %d: %v", name, source, n, err)
 }
 
 func (r *runner) zillow(ctx context.Context) {
 	sold := r.cfg.Mode == ModeSold
 	for _, c := range zillow.Counties {
+		if r.zl.blocked != nil {
+			return
+		}
 		name := "zillow mi " + c.Slug
 		if sold {
 			name += " sold"
 		}
 		ok := r.search(ctx, name, listing.SourceZillow, listing.MarketMI, map[string]bool{}, nil,
 			func(ctx context.Context, n int) (page, error) {
-				body, err := r.cfg.Fetcher.Fetch(ctx, zillow.SearchURL(c, n, sold))
+				body, err := r.zl.Fetch(ctx, zillow.SearchURL(c, n, sold))
 				if err != nil {
 					return page{}, err
 				}
@@ -460,6 +544,10 @@ var detailHosts = map[string]string{
 }
 
 func (r *runner) details(ctx context.Context, market string) {
+	if market == listing.MarketMI && r.zl.blocked != nil {
+		r.cfg.Log.Printf("detail %s: skipped (Zillow blocked this run)", market)
+		return
+	}
 	nd, err := r.cfg.API.NeedsDetail(ctx, market, r.cfg.DetailLimit)
 	if err != nil {
 		r.fail("detail %s: needs-detail: %v", market, err)
@@ -512,6 +600,9 @@ func (r *runner) details(ctx context.Context, market string) {
 		// The site wants a break: no more detail pages this run, but the
 		// listings and scores are fine, so the run does not fail for it.
 		r.cfg.Log.Printf("WARNING detail %s: blocked, no more detail reads this run: %v", market, stopErr)
+		if market == listing.MarketMI {
+			r.zl.blocked = stopErr
+		}
 	default:
 		r.fail("detail %s: stopping: %v", market, stopErr)
 	}

@@ -78,12 +78,12 @@ const (
 	// SoldBandLimit is the most results a search may report and still be
 	// walked whole: 20 pages × 41 = 820, with margin.
 	SoldBandLimit = 780
-	// NYCSoldWindow is the weekly sold crawl's window (Zillow "doz"). Sold
-	// rows stay in D1 and score-input keeps those sold in the last 365
-	// days, so weekly 6-month windows hold 12 months after six months, at
-	// ~110 requests a run; a 12-month window is ~7 900 results (~200 pages),
-	// over the run's request budget. Zillow also accepts "7", "14", "30",
-	// "90" and "12m".
+	// NYCSoldWindow is the sold crawl's window (Zillow "doz"). Sold rows
+	// stay in D1 and score-input keeps those sold in the last 365 days, so
+	// 6-month windows hold 12 months after six months; the whole 6-month
+	// window is ~4 000 results, ~105 pages (2026-10-07), read a few slots a
+	// day (NYCSoldSlots). A 12-month window is ~7 900 results (~200 pages).
+	// Zillow also accepts "7", "14", "30", "90" and "12m".
 	NYCSoldWindow = "6m"
 	// NYCMinSoldPrice: a 2+ bedroom NYC apartment "sold" for less is a
 	// transfer, a parking space or a typo (one said $16 273), not a comp.
@@ -107,6 +107,38 @@ func NewSoldSearch(b NYCBorough, window string) SoldSearch {
 		window = NYCSoldWindow
 	}
 	return SoldSearch{Borough: b, MaxPrice: MaxPrice, Window: window}
+}
+
+// NYCSoldSlots is the sold crawl's rotation: one search per (borough, price
+// band), in a fixed order that takes the boroughs in turn, so a borough comes
+// up every 3-5 slots. The bands are cut from the 6-month counts of
+// 2026-10-07 (Manhattan 1 231, Brooklyn 1 088, Queens 1 239, Bronx 330,
+// Staten Island 179 results; pages of 41 noted per band) so that each is
+// about 5-11 pages, which a day's request budget can walk whole; one that
+// grows past SoldBandLimit is still split by the crawler.
+func NYCSoldSlots(window string) []SoldSearch {
+	mn, bk, qn, bx, si := NYCBoroughs[0], NYCBoroughs[1], NYCBoroughs[2], NYCBoroughs[3], NYCBoroughs[4]
+	band := func(b NYCBorough, lo, hi int) SoldSearch {
+		s := NewSoldSearch(b, window)
+		s.MinPrice, s.MaxPrice = lo, hi
+		return s
+	}
+	return []SoldSearch{
+		band(mn, 0, 750000),         // 7
+		band(bk, 0, 500000),         // ~7 (14 for $0-750k)
+		band(qn, 0, 375000),         // 8
+		band(bx, 0, MaxPrice),       // 9
+		band(mn, 750001, 1125000),   // 11
+		band(bk, 500001, 750000),    // ~7
+		band(qn, 375001, 550000),    // ~8 (16 for $375k-750k)
+		band(si, 0, MaxPrice),       // 5
+		band(mn, 1125001, 1300000),  // ~6 (13 for $1.125M-1.5M)
+		band(bk, 750001, 1100000),   // ~7 (14 for $750k-1.5M)
+		band(qn, 550001, 750000),    // ~8
+		band(mn, 1300001, MaxPrice), // ~7
+		band(bk, 1100001, MaxPrice), // ~7
+		band(qn, 750001, MaxPrice),  // 7
+	}
 }
 
 // URL returns page n (1-based) of the search, most recent sales first.

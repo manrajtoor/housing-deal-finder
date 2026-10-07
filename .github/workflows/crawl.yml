@@ -9,8 +9,9 @@
 # unreliable at short intervals):
 #   */30 * * * *  mode=quick  newest page of each search, <= 6 detail pages
 #   0 11 * * *    mode=full   every page of each search, <= 20 detail pages
-#   0 12 * * 0    mode=sold   Michigan homes sold in the last 12 months, NYC
-#                             apartments sold in the last 6 months (Zillow, <= 150 requests)
+#   15 13 * * *   mode=sold   Michigan homes sold in the last 12 months, then NYC
+#                             apartments sold in the last 6 months, a few borough
+#                             price bands a day (Zillow, <= 25 requests 8 s apart)
 #
 # Setup (once, in the GitHub repo): Settings > Secrets and variables > Actions
 #   Secrets   > HOUSEDEALS_INGEST_TOKEN = the Worker's INGEST_TOKEN
@@ -18,8 +19,10 @@
 # Until HOUSEDEALS_API_URL is set, runs are skipped (so forks stay quiet).
 #
 # Politeness: one job at a time (concurrency), one request at a time inside
-# it, 1.5 s between requests (6 s between detail pages), a normal browser
-# User-Agent, and a source stops at its first error.
+# it, 1.5 s between requests (6 s between detail pages, 8 s between Zillow
+# pages in sold mode), a normal browser User-Agent, and a source stops at its
+# first error. Zillow answering 403 / 429 / a bot check ends the run's Zillow
+# requests with a warning; the run still succeeds.
 name: crawl
 
 on:

@@ -64,6 +64,10 @@ type HTTPFetcher struct {
 	Headers map[string]string
 	// Sleep waits between attempts; tests replace it to avoid real backoff.
 	Sleep func(time.Duration)
+	// NoRetry429, when set, says which URLs' 429 answers are returned at
+	// once instead of retried: a site that rate-limits for minutes only
+	// counts the retries against us.
+	NoRetry429 func(url string) bool
 }
 
 // NewHTTPFetcher returns a fetcher with 3 retries and a 30 s timeout.
@@ -97,7 +101,7 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, url string) (string, error) {
 		}
 		if err == nil {
 			httpErr := &HTTPError{Status: status, URL: url}
-			if status >= 400 && status < 500 && status != 429 {
+			if status >= 400 && status < 500 && (status != 429 || (f.NoRetry429 != nil && f.NoRetry429(url))) {
 				return "", httpErr
 			}
 			lastErr = httpErr

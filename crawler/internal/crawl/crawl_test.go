@@ -52,10 +52,10 @@ func site(t *testing.T, sold bool) fetch.Pages {
 		p[zillow.SearchURL(c, 1, sold)] = body
 	}
 	if sold {
-		// Every borough answers with the Staten Island page (302 results).
+		// Every NYC slot answers with the Staten Island page (302 results).
 		nyc := fixture(t, "../zillow/testdata/nyc_sold.html")
-		for _, b := range zillow.NYCBoroughs {
-			p[zillow.NewSoldSearch(b, "").URL(1)] = nyc
+		for _, s := range zillow.NYCSoldSlots("") {
+			p[s.URL(1)] = nyc
 		}
 	}
 	return p
@@ -244,20 +244,20 @@ func TestSoldModeCrawlsZillowSoldForBothMarkets(t *testing.T) {
 	if len(res.Failures) != 0 {
 		t.Fatal(res.Failures)
 	}
-	// NYC: one push (the other boroughs answer the same, already seen, rows), then the six counties.
+	// The six counties, then NYC: one push (the other slots answer the same, already seen, rows).
 	if len(api.pushes) != 7 {
 		t.Fatalf("pushes = %+v", api.pushes)
 	}
 	for i, p := range api.pushes {
 		want := "mi"
-		if i == 0 {
+		if i == 6 {
 			want = "nyc"
 		}
 		if p.scope.Mode != "sold" || p.scope.Source != "zillow" || p.scope.Market != want {
 			t.Errorf("push %d = %+v", i, p)
 		}
 	}
-	if api.pushes[0].n != 8 {
+	if api.pushes[6].n != 8 {
 		t.Errorf("nyc sold rows pushed = %d", api.pushes[0].n)
 	}
 	if api.asked != nil {
@@ -320,74 +320,243 @@ func (z *zlSoldSite) Fetch(_ context.Context, u string) (string, error) {
 	return body, nil
 }
 
-func TestSoldModeSplitsZillowNYCIntoPriceBands(t *testing.T) {
-	site := &zlSoldSite{
-		body: fixture(t, "../zillow/testdata/nyc_sold.html"),
-		count: func(region, lo, hi int) int {
-			switch {
-			case region != 270915: // Queens only is too big
-				return 300
-			case lo == 0 && hi == 1500000:
-				return 2600
-			case lo == 0 && hi == 750000:
-				return 1300
-			}
-			return 650
-		},
+// dayAt is a time on the day whose sold run starts at NYCSoldSlots[slot].
+func dayAt(slot int) time.Time {
+	n := int64(len(zillow.NYCSoldSlots("")))
+	d := now().Unix() / 86400
+	d = d - d%n + int64(slot)
+	return time.Unix(d*86400+13*3600+15*60, 0).UTC()
+}
+
+func TestSoldSlotStartMovesOnOneSlotADayAndCycles(t *testing.T) {
+	n := len(zillow.NYCSoldSlots(""))
+	day0 := dayAt(0)
+	for i := 0; i < 3*n; i++ {
+		d := day0.Add(time.Duration(i) * 24 * time.Hour)
+		if got := SoldSlotStart(d, n); got != i%n {
+			t.Fatalf("day %d: slot %d, want %d", i, got, i%n)
+		}
+		// Any time of the same UTC day gives the same slot.
+		if got := SoldSlotStart(d.Add(10*time.Hour+44*time.Minute), n); got != i%n {
+			t.Fatalf("day %d late: slot %d", i, got)
+		}
 	}
+	// 2026-12-31 to 2027-01-01 is just the next slot (no day-of-year reset).
+	a := SoldSlotStart(time.Date(2026, 12, 31, 13, 15, 0, 0, time.UTC), n)
+	if b := SoldSlotStart(time.Date(2027, 1, 1, 13, 15, 0, 0, time.UTC), n); b != (a+1)%n {
+		t.Errorf("new year: %d then %d", a, b)
+	}
+}
+
+func TestNYCSoldWalksTodaysSlotsUntilTheBudgetIsSpent(t *testing.T) {
+	slots := zillow.NYCSoldSlots("")
+	site := &zlSoldSite{body: fixture(t, "../zillow/testdata/nyc_sold.html"), count: func(int, int, int) int { return 60 }}
 	var logs bytes.Buffer
 	res := Run(context.Background(), Config{
-		Mode: ModeSold, Markets: []string{"nyc"}, DetailLimit: -1, DryRun: true,
-		Fetcher: site, Log: log.New(&logs, "", 0), Now: now,
+		Mode: ModeSold, Markets: []string{"nyc"}, DetailLimit: -1, DryRun: true, SoldBudget: 5,
+		Fetcher: site, Log: log.New(&logs, "", 0), Now: func() time.Time { return dayAt(len(slots) - 1) },
 	})
 	if len(res.Failures) != 0 {
-		t.Fatalf("failures %v\n%s", res.Failures, logs.String())
+		t.Fatalf("a spent budget is not a failure: %v\n%s", res.Failures, logs.String())
 	}
-	want := []string{
-		"12530:0-1500000:1", "12530:0-1500000:2",
-		"37607:0-1500000:1", "37607:0-1500000:2",
-		"270915:0-1500000:1", // probe, split
-		"270915:0-750000:1",  // probe, split again
-		"270915:0-375000:1", "270915:0-375000:2",
-		"270915:375001-750000:1", "270915:375001-750000:2",
-		"270915:750001-1500000:1", "270915:750001-1500000:2",
-		"17182:0-1500000:1", "17182:0-1500000:2",
-		"27252:0-1500000:1", "27252:0-1500000:2",
+	key := func(s zillow.SoldSearch, page int) string {
+		return fmt.Sprintf("%d:%d-%d:%d", s.Borough.RegionID, s.MinPrice, s.MaxPrice, page)
 	}
+	last, first, second := slots[len(slots)-1], slots[0], slots[1]
+	want := []string{key(last, 1), key(last, 2), key(first, 1), key(first, 2), key(second, 1)} // wraps around
 	if fmt.Sprint(site.asked) != fmt.Sprint(want) {
 		t.Errorf("asked\n %v\nwant\n %v", site.asked, want)
 	}
-	if len(res.Listings) != len(want)*8 {
-		t.Errorf("listings = %d, want %d pages x 8", len(res.Listings), len(want))
+	if len(res.Listings) != 5*8 {
+		t.Errorf("listings %d", len(res.Listings))
 	}
 	for _, s := range []string{
-		"zillow nyc queens: 2600 results > 780, splitting at $750000",
-		"zillow nyc queens $0-750,000: 1300 results > 780, splitting at $375000",
-		"zillow nyc queens $375,001-750,000 sold: pages 2/2, listings 16",
-		"zillow nyc sold queens: 64 sold rows (window 6m), 138 of 150 requests left",
+		"zillow nyc sold: starting at slot 14/14 (queens $750,001-1,500,000), 5 of 5 Zillow requests left",
+		"zillow nyc sold slot 1/14 manhattan $0-750,000: 16 sold rows (window 6m), 1 of 5 requests left",
+		"zillow nyc brooklyn $0-500,000: stopping zillow at page 2: request budget spent",
 	} {
 		if !strings.Contains(logs.String(), s) {
 			t.Errorf("log lacks %q\n%s", s, logs.String())
 		}
 	}
+	if strings.Contains(logs.String(), "WARNING") {
+		t.Errorf("a spent budget is no warning:\n%s", logs.String())
+	}
+
+	// The next day starts one slot on.
+	site.asked = nil
+	Run(context.Background(), Config{
+		Mode: ModeSold, Markets: []string{"nyc"}, DetailLimit: -1, DryRun: true, SoldBudget: 1,
+		Fetcher: site, Now: func() time.Time { return dayAt(0) },
+	})
+	if fmt.Sprint(site.asked) != fmt.Sprint([]string{key(first, 1)}) {
+		t.Errorf("next day asked %v", site.asked)
+	}
 }
 
-func TestNYCSoldStopsAtTheRequestBudgetWithAWarning(t *testing.T) {
-	defer func(n int) { NYCSoldBudget = n }(NYCSoldBudget)
-	NYCSoldBudget = 5
-	site := &zlSoldSite{body: fixture(t, "../zillow/testdata/nyc_sold.html"), count: func(int, int, int) int { return 300 }}
+func TestNYCSoldSplitsASlotThatGrewPastTheBandLimit(t *testing.T) {
+	site := &zlSoldSite{
+		body: fixture(t, "../zillow/testdata/nyc_sold.html"),
+		count: func(region, lo, hi int) int {
+			if region == 12530 && lo == 0 && hi == 750000 {
+				return 1000
+			}
+			return 300
+		},
+	}
 	var logs bytes.Buffer
 	res := Run(context.Background(), Config{
-		Mode: ModeSold, Markets: []string{"nyc"}, DetailLimit: -1, DryRun: true,
-		Fetcher: site, Log: log.New(&logs, "", 0), Now: now,
+		Mode: ModeSold, Markets: []string{"nyc"}, DetailLimit: -1, DryRun: true, SoldBudget: 6,
+		Fetcher: site, Log: log.New(&logs, "", 0), Now: func() time.Time { return dayAt(0) },
 	})
 	if len(res.Failures) != 0 {
-		t.Fatalf("a spent budget is not a failure: %v", res.Failures)
+		t.Fatalf("failures %v\n%s", res.Failures, logs.String())
 	}
-	if len(site.asked) != 5 || len(res.Listings) != 5*8 {
-		t.Errorf("asked %d, listings %d", len(site.asked), len(res.Listings))
+	want := []string{
+		"12530:0-750000:1", // probe, split
+		"12530:0-375000:1", "12530:0-375000:2",
+		"12530:375001-750000:1", "12530:375001-750000:2",
+		"37607:0-500000:1", // next slot: Brooklyn
 	}
-	if !strings.Contains(logs.String(), "WARNING zillow nyc queens: stopping zillow at page 2: request budget spent") {
+	if fmt.Sprint(site.asked) != fmt.Sprint(want) {
+		t.Errorf("asked\n %v\nwant\n %v", site.asked, want)
+	}
+	if !strings.Contains(logs.String(), "zillow nyc manhattan $0-750,000: 1000 results > 780, splitting at $375000") {
+		t.Errorf("logs:\n%s", logs.String())
+	}
+}
+
+func TestSoldModeReadsMichiganFirstWithinOneBudget(t *testing.T) {
+	var asked []string
+	f := recordFetches{site(t, true), &asked}
+	res := Run(context.Background(), Config{
+		Mode: ModeSold, Markets: []string{"nyc", "mi"}, MaxPages: 1, DetailLimit: -1, DryRun: true, SoldBudget: 8,
+		Fetcher: f, Now: func() time.Time { return dayAt(3) },
+	})
+	if len(res.Failures) != 0 {
+		t.Fatal(res.Failures)
+	}
+	slots := zillow.NYCSoldSlots("")
+	var want []string
+	for _, c := range zillow.Counties {
+		want = append(want, zillow.SearchURL(c, 1, true))
+	}
+	want = append(want, slots[3].URL(1), slots[4].URL(1))
+	if fmt.Sprint(asked) != fmt.Sprint(want) {
+		t.Errorf("asked %d requests:\n%v", len(asked), asked)
+	}
+}
+
+type recordFetches struct {
+	f     fetch.Fetcher
+	asked *[]string
+}
+
+func (r recordFetches) Fetch(ctx context.Context, u string) (string, error) {
+	*r.asked = append(*r.asked, u)
+	return r.f.Fetch(ctx, u)
+}
+
+func TestSoldModeSpacesZillowPagesByZillowDelay(t *testing.T) {
+	start := time.Now()
+	res := Run(context.Background(), Config{
+		Mode: ModeSold, Markets: []string{"mi"}, MaxPages: 1, DetailLimit: -1, DryRun: true,
+		Fetcher: site(t, true), ZillowDelay: 30 * time.Millisecond, Now: now,
+	})
+	if len(res.Failures) != 0 || len(res.Listings) != 24 {
+		t.Fatalf("failures %v listings %d", res.Failures, len(res.Listings))
+	}
+	if d := time.Since(start); d < 5*30*time.Millisecond {
+		t.Errorf("6 Zillow pages took %v, want >= 5 x 30ms", d)
+	}
+	// Quick and full keep the Fetcher's own spacing.
+	start = time.Now()
+	Run(context.Background(), Config{
+		Mode: ModeQuick, Markets: []string{"mi"}, DetailLimit: 0, DryRun: true,
+		Fetcher: site(t, false), ZillowDelay: time.Second, Now: now,
+	})
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Errorf("quick mode took %v: ZillowDelay is for sold runs only", d)
+	}
+}
+
+// zillowAnswers answers Zillow URLs with err from the n-th Zillow request
+// on (1-based), the site otherwise; it counts Zillow requests.
+type zillowAnswers struct {
+	pages fetch.Pages
+	from  int
+	err   func(u string) error
+	n     *int
+}
+
+func (z zillowAnswers) Fetch(ctx context.Context, u string) (string, error) {
+	if strings.Contains(u, "zillow.com") {
+		*z.n++
+		if *z.n >= z.from {
+			return "", z.err(u)
+		}
+	}
+	return z.pages.Fetch(ctx, u)
+}
+
+func TestZillowBlockedIsAWarningThatEndsEveryZillowRequest(t *testing.T) {
+	cases := []struct {
+		name string
+		err  func(u string) error
+	}{
+		{"429", func(u string) error { return &fetch.HTTPError{Status: 429, URL: u} }},
+		{"403", func(u string) error { return &fetch.HTTPError{Status: 403, URL: u} }},
+		{"bot check", func(string) error {
+			return &fetch.ParseError{Msg: "zillow search: no __NEXT_DATA__ in the page (bot check page)"}
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			n := 0
+			api := &fakeAPI{needs: map[string]apistore.NeedsDetail{
+				"nyc": {IDs: []string{"se:1851487"}, URLs: []string{seDetailURL}},
+				"mi":  {IDs: []string{"zl:94778208"}, URLs: []string{zlDetailURL}},
+			}}
+			var logs bytes.Buffer
+			res := Run(context.Background(), Config{
+				Mode: ModeQuick, Markets: []string{"nyc", "mi"}, DetailLimit: -1,
+				Fetcher: zillowAnswers{site(t, false), 3, c.err, &n}, API: api, Log: log.New(&logs, "", 0), Now: now,
+			})
+			if len(res.Failures) != 0 {
+				t.Fatalf("blocked is not a failure: %v", res.Failures)
+			}
+			if n != 3 {
+				t.Errorf("zillow requests = %d, want 3 (two counties, then the blocked one, then none)", n)
+			}
+			// StreetEasy, its detail page and the two counties before the block are still pushed.
+			if len(api.pushes) != 3 || len(api.details) != 1 || api.details[0].ID != "se:1851487" {
+				t.Errorf("pushes %+v details %+v", api.pushes, api.details)
+			}
+			for _, s := range []string{
+				"WARNING zillow mi antrim: Zillow is blocking us at page 1",
+				"no more Zillow requests this run",
+				"detail mi: skipped (Zillow blocked this run)",
+			} {
+				if !strings.Contains(logs.String(), s) {
+					t.Errorf("log lacks %q\n%s", s, logs.String())
+				}
+			}
+		})
+	}
+}
+
+func TestZillow429InSoldModeSkipsNYC(t *testing.T) {
+	n := 0
+	var logs bytes.Buffer
+	res := Run(context.Background(), Config{
+		Mode: ModeSold, Markets: []string{"nyc", "mi"}, MaxPages: 1, DetailLimit: -1, DryRun: true,
+		Fetcher: zillowAnswers{site(t, true), 2, func(u string) error { return &fetch.HTTPError{Status: 429, URL: u} }, &n},
+		Log:     log.New(&logs, "", 0), Now: now,
+	})
+	if len(res.Failures) != 0 || n != 2 || len(res.Listings) != 4 {
+		t.Errorf("failures %v, zillow requests %d, listings %d\n%s", res.Failures, n, len(res.Listings), logs.String())
+	}
+	if !strings.Contains(logs.String(), "zillow nyc sold: skipped (Zillow blocked this run)") {
 		t.Errorf("logs:\n%s", logs.String())
 	}
 }

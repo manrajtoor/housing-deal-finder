@@ -407,3 +407,31 @@ func TestSplitUnit(t *testing.T) {
 		}
 	}
 }
+
+func TestNYCSoldSlotsCoverEachBoroughOnceWithoutGaps(t *testing.T) {
+	slots := NYCSoldSlots("90")
+	if len(slots) != 14 {
+		t.Fatalf("slots = %d", len(slots))
+	}
+	next := map[string]int{} // borough -> lowest price not yet covered
+	for i, s := range slots {
+		if s.Window != "90" {
+			t.Errorf("slot %d window %q", i, s.Window)
+		}
+		if s.MinPrice != next[s.Borough.Slug] || s.MaxPrice <= s.MinPrice {
+			t.Errorf("slot %d %s: band starts at %d, want %d", i, s.Label(), s.MinPrice, next[s.Borough.Slug])
+		}
+		next[s.Borough.Slug] = s.MaxPrice + 1
+		if i > 0 && slots[i-1].Borough == s.Borough {
+			t.Errorf("slots %d and %d are both %s: boroughs take turns", i-1, i, s.Borough.Slug)
+		}
+	}
+	for _, b := range NYCBoroughs {
+		if next[b.Slug] != MaxPrice+1 {
+			t.Errorf("%s covered up to %d", b.Slug, next[b.Slug]-1)
+		}
+	}
+	if NYCSoldSlots("")[0].Window != NYCSoldWindow {
+		t.Error("default window")
+	}
+}

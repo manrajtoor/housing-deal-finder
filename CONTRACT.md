@@ -103,4 +103,4 @@ Listing fields shown on the dashboard (`id url address unit city neighborhood bo
 |---|---|
 | `*/30 * * * *` | `quick`: newest page per search, then needs-detail (≤ 6 detail pages per market), then scoring. |
 | `0 11 * * *` | `full`: every page per search, then needs-detail (≤ 20), then scoring. The Worker also expires active listings unseen for 3 days in this same cron and deletes the scores of removed listings. |
-| `0 12 * * SUN` | `sold`: Michigan sold in the last 12 months and NYC apartments sold in the last 6 months (Zillow, ≤ 150 requests), then scoring of both. |
+| `15 13 * * *` | `sold`: Michigan sold in the last 12 months, then NYC apartments sold in the last 6 months, a rotation of borough price bands from the UTC date on (Zillow, ≤ 25 requests 8 s apart, `--sold-budget`), then scoring of both. |

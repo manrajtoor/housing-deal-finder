@@ -13,7 +13,9 @@ use serde_json::{json, Value};
 
 pub const QUICK_CRON: &str = "*/30 * * * *";
 pub const FULL_CRON: &str = "0 11 * * *";
-pub const SOLD_CRON: &str = "0 12 * * SUN";
+/// Daily at 13:15 UTC: away from the 11:00 full sweep and between the
+/// quick runs at :00 and :30.
+pub const SOLD_CRON: &str = "15 13 * * *";
 
 /// The crawl `mode` a cron starts (CONTRACT.md "Worker crons").
 pub fn mode_for(cron: &str) -> Option<&'static str> {
@@ -117,7 +119,9 @@ mod tests {
     fn crons_map_to_modes() {
         assert_eq!(mode_for("*/30 * * * *"), Some("quick"));
         assert_eq!(mode_for("0 11 * * *"), Some("full"));
-        assert_eq!(mode_for("0 12 * * SUN"), Some("sold"));
+        assert_eq!(mode_for("15 13 * * *"), Some("sold"));
+        assert_eq!(mode_for("0 12 * * SUN"), None, "the weekly sold cron is gone");
+        assert!(!expires("15 13 * * *"));
         assert_eq!(mode_for("* * * * *"), None);
         assert!(expires("0 11 * * *") && !expires("*/30 * * * *"));
     }

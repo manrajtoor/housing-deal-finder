@@ -3,7 +3,7 @@
 //
 //	housedeals --mode quick|full|sold [--market nyc|mi|all] [--push URL]
 //	           [--dry-run] [--max-pages N] [--detail-limit N] [--delay 1.5s]
-//	           [--scorer PATH | --no-score] [--sold-window 6m]
+//	           [--scorer PATH | --no-score] [--sold-window 6m] [--sold-budget 25]
 //
 // The ingest token comes from HOUSEDEALS_INGEST_TOKEN. --dry-run prints the
 // listings (and any detail reads) as JSON on stdout and pushes nothing.
@@ -12,8 +12,10 @@
 // binary (scorer/) and the scores posted (POST /api/scores).
 // Logs go to stderr, one line per search, detail step and market scored.
 // The exit status is 1 when a source, a push, a detail read or the scoring
-// failed (what was gathered is still pushed); a detail page that is blocked
-// only stops the detail reads, with a warning.
+// failed (what was gathered is still pushed). Being blocked is not a
+// failure: a Zillow 403 / 429 / bot check stops every Zillow request of the
+// run, and a blocked StreetEasy detail page the NYC detail reads, with a
+// warning and exit status 0.
 package main
 
 import (
@@ -24,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -44,6 +47,11 @@ var throttleDelay = fetch.DefaultDelay
 // pages 1.5 s apart (tests shorten it).
 var detailDelay = 6 * time.Second
 
+// zillowSoldDelay spaces Zillow search pages in sold mode: from a GitHub
+// runner Zillow answered 429 after ~22 search pages 1.5 s apart (tests
+// shorten it).
+var zillowSoldDelay = 8 * time.Second
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -55,6 +63,7 @@ type options struct {
 	soldWindow                 string
 	dryRun, noScore            bool
 	maxPages, detailLimit      int
+	soldBudget                 int
 	delay                      time.Duration
 }
 
@@ -72,6 +81,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&o.scorer, "scorer", "housedeals-score", "path of the scorer binary (scorer/, cargo build --release)")
 	fs.BoolVar(&o.noScore, "no-score", false, "push listings and details but do not score")
 	fs.StringVar(&o.soldWindow, "sold-window", "", "NYC sold window, Zillow's: 7, 14, 30, 90, 6m or 12m (default 6m)")
+	fs.IntVar(&o.soldBudget, "sold-budget", crawl.DefaultSoldBudget, "Zillow requests per sold run, Michigan first, then NYC's rotation")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -92,6 +102,9 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	case "", "7", "14", "30", "90", "6m", "12m":
 	default:
 		return o, fmt.Errorf("--sold-window must be 7, 14, 30, 90, 6m or 12m (got %q)", o.soldWindow)
+	}
+	if o.soldBudget <= 0 {
+		return o, errors.New("--sold-budget must be positive")
 	}
 	if o.maxPages < 0 {
 		return o, errors.New("--max-pages must be positive")
@@ -136,7 +149,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		markets = []string{o.market}
 	}
 	if fetcher == nil {
-		fetcher = fetch.NewHTTPFetcher()
+		hf := fetch.NewHTTPFetcher()
+		hf.NoRetry429 = isZillow // Zillow's 429 lasts; retries would only add to it
+		fetcher = hf
 	}
 	// One throttle for every request of the run, whatever the source.
 	fetcher = fetch.NewThrottle(max(o.delay, throttleDelay)).Wrap(fetcher)
@@ -144,6 +159,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	res := crawl.Run(ctx, crawl.Config{
 		Mode: o.mode, Markets: markets, MaxPages: o.maxPages, DetailLimit: o.detailLimit,
 		DryRun: o.dryRun, Fetcher: fetcher, API: api, Scorer: scorer, DetailDelay: detailDelay, SoldWindow: o.soldWindow,
+		ZillowDelay: zillowSoldDelay, SoldBudget: o.soldBudget,
 		Out: stdout, Log: logger,
 	})
 	logger.Printf("done: %d listings, %d detail reads, %d failures", len(res.Listings), len(res.Details), len(res.Failures))
@@ -151,6 +167,15 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		return 1
 	}
 	return 0
+}
+
+func isZillow(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	h := u.Hostname()
+	return h == "zillow.com" || strings.HasSuffix(h, ".zillow.com")
 }
 
 // execScorer runs the housedeals-score binary: input on stdin, writes on stdout.
