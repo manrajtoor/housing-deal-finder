@@ -3,7 +3,7 @@
 //
 //	housedeals --mode quick|full|sold [--market nyc|mi|all] [--push URL]
 //	           [--dry-run] [--max-pages N] [--detail-limit N] [--delay 1.5s]
-//	           [--scorer PATH | --no-score]
+//	           [--scorer PATH | --no-score] [--sold-window 6m]
 //
 // The ingest token comes from HOUSEDEALS_INGEST_TOKEN. --dry-run prints the
 // listings (and any detail reads) as JSON on stdout and pushes nothing.
@@ -52,6 +52,7 @@ func main() {
 
 type options struct {
 	mode, market, push, scorer string
+	soldWindow                 string
 	dryRun, noScore            bool
 	maxPages, detailLimit      int
 	delay                      time.Duration
@@ -61,7 +62,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	var o options
 	fs := flag.NewFlagSet("housedeals", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.StringVar(&o.mode, "mode", "", "quick (newest page of each search), full (every page) or sold (Michigan sold comps)")
+	fs.StringVar(&o.mode, "mode", "", "quick (newest page of each search), full (every page) or sold (sold comps: Michigan, and NYC from Zillow)")
 	fs.StringVar(&o.market, "market", "all", "nyc, mi or all")
 	fs.StringVar(&o.push, "push", "", "Worker base URL to push to (token from "+apistore.TokenEnv+")")
 	fs.BoolVar(&o.dryRun, "dry-run", false, "print JSON to stdout, push nothing")
@@ -70,6 +71,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.DurationVar(&o.delay, "delay", 0, "spacing between requests (default and minimum 1.5s)")
 	fs.StringVar(&o.scorer, "scorer", "housedeals-score", "path of the scorer binary (scorer/, cargo build --release)")
 	fs.BoolVar(&o.noScore, "no-score", false, "push listings and details but do not score")
+	fs.StringVar(&o.soldWindow, "sold-window", "", "NYC sold window, Zillow's: 7, 14, 30, 90, 6m or 12m (default 6m)")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -85,6 +87,11 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	case "nyc", "mi", "all":
 	default:
 		return o, fmt.Errorf("--market must be nyc, mi or all (got %q)", o.market)
+	}
+	switch o.soldWindow {
+	case "", "7", "14", "30", "90", "6m", "12m":
+	default:
+		return o, fmt.Errorf("--sold-window must be 7, 14, 30, 90, 6m or 12m (got %q)", o.soldWindow)
 	}
 	if o.maxPages < 0 {
 		return o, errors.New("--max-pages must be positive")
@@ -136,7 +143,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 
 	res := crawl.Run(ctx, crawl.Config{
 		Mode: o.mode, Markets: markets, MaxPages: o.maxPages, DetailLimit: o.detailLimit,
-		DryRun: o.dryRun, Fetcher: fetcher, API: api, Scorer: scorer, DetailDelay: detailDelay,
+		DryRun: o.dryRun, Fetcher: fetcher, API: api, Scorer: scorer, DetailDelay: detailDelay, SoldWindow: o.soldWindow,
 		Out: stdout, Log: logger,
 	})
 	logger.Printf("done: %d listings, %d detail reads, %d failures", len(res.Listings), len(res.Details), len(res.Failures))

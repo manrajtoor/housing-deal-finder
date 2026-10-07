@@ -1,5 +1,6 @@
 // Package zillow reads Zillow search and home-detail pages for the six
-// northern Michigan counties.
+// northern Michigan counties, and Zillow's recently-sold search for the five
+// NYC boroughs (sold comps; see SoldSearch).
 //
 // Search pages embed <script id="__NEXT_DATA__"> with
 // props.pageProps.searchPageState.cat1.searchResults.listResults (41 a page)
@@ -24,6 +25,7 @@ import (
 	"housedeals/crawler/internal/geo"
 	"housedeals/crawler/internal/jsonx"
 	"housedeals/crawler/internal/listing"
+	"housedeals/crawler/internal/streeteasy"
 	"housedeals/crawler/internal/water"
 )
 
@@ -48,6 +50,118 @@ var Counties = []County{
 	{"benzie", 873, "traverse"},
 	{"charlevoix", 2898, "petoskey"},
 	{"emmet", 501, "petoskey"},
+}
+
+// NYCBorough is a Zillow borough region (regionType 17). Slug is the
+// contract's borough name.
+type NYCBorough struct {
+	Slug     string
+	RegionID int
+}
+
+// NYCBoroughs: the regionSelection of https://www.zillow.com/<borough>-new-york-ny/
+// (manhattan-, brooklyn-, queens-, bronx-, staten-island-), verified live
+// 2026-10-07. ("new-york-ny" is the city, region 6181 type 6.)
+var NYCBoroughs = []NYCBorough{
+	{"manhattan", 12530},
+	{"brooklyn", 37607},
+	{"queens", 270915},
+	{"bronx", 17182},
+	{"staten_island", 27252},
+}
+
+// NYC recently-sold searches.
+const (
+	// SoldPageCap is the most pages Zillow serves for one search
+	// (totalPages is capped at 20, 41 results a page).
+	SoldPageCap = 20
+	// SoldBandLimit is the most results a search may report and still be
+	// walked whole: 20 pages × 41 = 820, with margin.
+	SoldBandLimit = 780
+	// NYCSoldWindow is the weekly sold crawl's window (Zillow "doz"). Sold
+	// rows stay in D1 and score-input keeps those sold in the last 365
+	// days, so weekly 6-month windows hold 12 months after six months, at
+	// ~110 requests a run; a 12-month window is ~7 900 results (~200 pages),
+	// over the run's request budget. Zillow also accepts "7", "14", "30",
+	// "90" and "12m".
+	NYCSoldWindow = "6m"
+	// NYCMinSoldPrice: a 2+ bedroom NYC apartment "sold" for less is a
+	// transfer, a parking space or a typo (one said $16 273), not a comp.
+	NYCMinSoldPrice = 100000
+)
+
+// SoldSearch is one Zillow recently-sold search of an NYC borough: 2+
+// bedrooms, no houses, townhouses, multi-family, land or manufactured
+// homes, sold within Window, in a price band. Zillow's price filter is
+// inclusive on both ends.
+type SoldSearch struct {
+	Borough  NYCBorough
+	MinPrice int // 0 = no floor
+	MaxPrice int
+	Window   string // Zillow "doz": "6m", "12m", "90", ...
+}
+
+// NewSoldSearch is the whole-borough search (up to MaxPrice).
+func NewSoldSearch(b NYCBorough, window string) SoldSearch {
+	if window == "" {
+		window = NYCSoldWindow
+	}
+	return SoldSearch{Borough: b, MaxPrice: MaxPrice, Window: window}
+}
+
+// URL returns page n (1-based) of the search, most recent sales first.
+func (s SoldSearch) URL(page int) string {
+	v := func(x any) map[string]any { return map[string]any{"value": x} }
+	price := map[string]any{"max": s.MaxPrice}
+	if s.MinPrice > 0 {
+		price["min"] = s.MinPrice
+	}
+	fs := map[string]any{
+		"price": price, "beds": map[string]any{"min": 2}, "sort": v("days"),
+		"rs": v(true), "doz": v(s.Window),
+	}
+	for _, k := range []string{"fsba", "fsbo", "nc", "cmsn", "auc", "fore", "sf", "tow", "mf", "land", "manu"} {
+		fs[k] = v(false)
+	}
+	q := map[string]any{
+		"pagination":      map[string]any{"currentPage": max(page, 1)},
+		"isMapVisible":    false,
+		"regionSelection": []any{map[string]any{"regionId": s.Borough.RegionID, "regionType": 17}},
+		"filterState":     fs,
+		"isListVisible":   true,
+	}
+	b, _ := json.Marshal(q)
+	return Base + "/homes/for_sale/?searchQueryState=" + url.QueryEscape(string(b))
+}
+
+// Label names the search in logs: "brooklyn", "brooklyn $750,001-1,500,000".
+func (s SoldSearch) Label() string {
+	if s.MinPrice <= 0 && s.MaxPrice == MaxPrice {
+		return s.Borough.Slug
+	}
+	return fmt.Sprintf("%s $%s-%s", s.Borough.Slug, money(s.MinPrice), money(s.MaxPrice))
+}
+
+func money(n int) string {
+	s := fmt.Sprint(n)
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return s
+}
+
+// Split halves the price band at a multiple of $25 000: [Min, mid] and
+// [mid+1, Max]. ok is false when the band is too narrow to split.
+func (s SoldSearch) Split() (lo, hi SoldSearch, ok bool) {
+	const step = 25000
+	mid := (s.MinPrice + s.MaxPrice) / 2 / step * step
+	if mid <= s.MinPrice || mid >= s.MaxPrice {
+		return s, s, false
+	}
+	lo, hi = s, s
+	lo.MaxPrice = mid
+	hi.MinPrice = mid + 1
+	return lo, hi, true
 }
 
 type boolValue struct {
@@ -140,8 +254,24 @@ func nextData(html, what string) (any, error) {
 	return v, nil
 }
 
+// place is where a search looks: a Michigan county, or an NYC borough.
+type place struct {
+	market  string
+	county  County     // Michigan
+	borough NYCBorough // NYC
+}
+
 // ParseSearch reads a search page of county c.
 func ParseSearch(html string, c County, sold bool) (SearchPage, error) {
+	return parseSearch(html, place{market: listing.MarketMI, county: c}, sold)
+}
+
+// ParseNYCSold reads a recently-sold search page of borough b (SoldSearch).
+func ParseNYCSold(html string, b NYCBorough) (SearchPage, error) {
+	return parseSearch(html, place{market: listing.MarketNYC, borough: b}, true)
+}
+
+func parseSearch(html string, pl place, sold bool) (SearchPage, error) {
 	nd, err := nextData(html, "search")
 	if err != nil {
 		return SearchPage{}, err
@@ -159,7 +289,7 @@ func ParseSearch(html string, c County, sold bool) (SearchPage, error) {
 	}
 	seen := map[string]bool{}
 	for _, r := range jsonx.Slice(results) {
-		l, ok := toListing(jsonx.Map(r), c, sold)
+		l, ok := toListing(jsonx.Map(r), pl, sold)
 		if !ok {
 			p.Dropped++
 			continue
@@ -172,7 +302,7 @@ func ParseSearch(html string, c County, sold bool) (SearchPage, error) {
 	return p, nil
 }
 
-func toListing(r map[string]any, c County, sold bool) (listing.Listing, bool) {
+func toListing(r map[string]any, pl place, sold bool) (listing.Listing, bool) {
 	if r == nil {
 		return listing.Listing{}, false
 	}
@@ -197,7 +327,7 @@ func toListing(r map[string]any, c County, sold bool) (listing.Listing, bool) {
 	l := listing.Listing{
 		ID:       "zl:" + zpid,
 		Source:   listing.SourceZillow,
-		Market:   listing.MarketMI,
+		Market:   pl.market,
 		Status:   listing.StatusActive,
 		URL:      absURL(jsonx.String(r["detailUrl"]), zpid),
 		Address:  strings.TrimSpace(jsonx.String(firstOf(r["addressStreet"], hi["streetAddress"], r["address"]))),
@@ -205,9 +335,31 @@ func toListing(r map[string]any, c County, sold bool) (listing.Listing, bool) {
 		HomeType: HomeType(jsonx.String(hi["homeType"])),
 		City:     listing.Str(jsonx.String(firstOf(r["addressCity"], hi["city"]))),
 		Zip:      listing.Str(jsonx.String(firstOf(r["addressZipcode"], hi["zipcode"]))),
-		County:   listing.Str(c.Slug),
-		Area:     listing.Str(c.Area),
 		PhotoURL: listing.Str(jsonx.String(r["imgSrc"])),
+	}
+	if pl.market == listing.MarketNYC {
+		// A sale with no address cannot be matched to a building, and one far
+		// under any NYC apartment price is not an open-market sale.
+		if undisclosed, _ := r["isUndisclosedAddress"].(bool); undisclosed ||
+			strings.Contains(strings.ToLower(l.Address), "undisclosed") || l.Address == "" || price < NYCMinSoldPrice {
+			return listing.Listing{}, false
+		}
+		var unit string
+		l.Address, unit = SplitUnit(l.Address)
+		if unit == "" {
+			_, unit = SplitUnit("x " + jsonx.String(hi["unit"]))
+		}
+		if unit != "" {
+			l.Unit = listing.Str("#" + unit)
+		}
+		b := streeteasy.BoroughFromZip(strOf(l.Zip))
+		if b == "" {
+			b = pl.borough.Slug
+		}
+		l.Borough = listing.Str(b)
+	} else {
+		l.County = listing.Str(pl.county.Slug)
+		l.Area = listing.Str(pl.county.Area)
 	}
 	l.Lat = jsonx.NumPtr(hi["latitude"])
 	l.Lon = jsonx.NumPtr(hi["longitude"])
@@ -215,7 +367,7 @@ func toListing(r map[string]any, c County, sold bool) (listing.Listing, bool) {
 		l.Lat = jsonx.NumPtr(jsonx.Get(r, "latLong", "latitude"))
 		l.Lon = jsonx.NumPtr(jsonx.Get(r, "latLong", "longitude"))
 	}
-	if l.Lat != nil && l.Lon != nil {
+	if pl.market == listing.MarketMI && l.Lat != nil && l.Lon != nil {
 		// Water from the map; a detail read's description replaces it later.
 		if typ, body, _, ok := geo.Classify(*l.Lat, *l.Lon); ok {
 			l.WaterType, l.WaterBody = listing.Str(typ), listing.Str(body)
@@ -227,7 +379,9 @@ func toListing(r map[string]any, c County, sold bool) (listing.Listing, bool) {
 	}
 	l.Baths = jsonx.PosFloat(firstOf(hi["bathrooms"], r["baths"]))
 	l.Sqft = jsonx.PosInt(firstOf(hi["livingArea"], r["area"]))
-	l.LotSqft = lotSqft(hi["lotAreaValue"], jsonx.String(hi["lotAreaUnit"]))
+	if pl.market == listing.MarketMI {
+		l.LotSqft = lotSqft(hi["lotAreaValue"], jsonx.String(hi["lotAreaUnit"]))
+	}
 	l.Zestimate = jsonx.PosInt(firstOf(hi["zestimate"], r["zestimate"]))
 	if sold {
 		l.Status = listing.StatusSold
@@ -239,6 +393,29 @@ func toListing(r map[string]any, c County, sold bool) (listing.Listing, bool) {
 		l.DaysOnMarket = &d
 	}
 	return l, true
+}
+
+func strOf(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+// unitRe matches the unit at the end of a Zillow street address:
+// "1408 Avenue O APT 3B", "1235 Forest Hill Rd #2E", "50 Fort Pl #B3-b/a",
+// "10 W End Ave UNIT 4C".
+var unitRe = regexp.MustCompile(`(?i)\s+(?:(?:APT|APARTMENT|UNIT|STE|SUITE|RM|FL)\.?\s*#?\s*|#\s*)([A-Z0-9][A-Z0-9/-]*)\s*$`)
+
+// SplitUnit cuts the unit off a street address: ("1408 Avenue O", "3B") for
+// "1408 Avenue O APT 3B". The unit is upper case; "" when there is none.
+func SplitUnit(street string) (address, unit string) {
+	street = strings.TrimSpace(street)
+	m := unitRe.FindStringSubmatchIndex(street)
+	if m == nil {
+		return street, ""
+	}
+	return strings.TrimSpace(street[:m[0]]), strings.ToUpper(street[m[2]:m[3]])
 }
 
 // firstOf returns the first value that is neither null nor "".

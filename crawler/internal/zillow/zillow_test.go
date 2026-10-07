@@ -236,6 +236,7 @@ func TestHomeType(t *testing.T) {
 	for in, want := range map[string]string{
 		"SINGLE_FAMILY": "single_family", "CONDO": "condo", "TOWNHOUSE": "townhouse",
 		"MULTI_FAMILY": "multi_family", "MANUFACTURED": "other", "LOT": "other", "": "other",
+		"COOPERATIVE": "coop", "APARTMENT": "other",
 	} {
 		if got := HomeType(in); got != want {
 			t.Errorf("HomeType(%q) = %q", in, got)
@@ -249,4 +250,160 @@ func deref[T any](p *T) T {
 		return zero
 	}
 	return *p
+}
+
+func TestSoldSearchURL(t *testing.T) {
+	bk := NYCBoroughs[1]
+	s := NewSoldSearch(bk, "")
+	if s.Window != "6m" || s.MaxPrice != 1500000 || s.Label() != "brooklyn" {
+		t.Fatalf("search = %+v %q", s, s.Label())
+	}
+	q := queryOf(t, s.URL(3))
+	fs := q["filterState"].(map[string]any)
+	r := q["regionSelection"].([]any)[0].(map[string]any)
+	if r["regionId"].(float64) != 37607 || r["regionType"].(float64) != 17 || q["pagination"].(map[string]any)["currentPage"].(float64) != 3 {
+		t.Errorf("query = %v", q)
+	}
+	if fs["rs"].(map[string]any)["value"] != true || fs["doz"].(map[string]any)["value"] != "6m" ||
+		fs["beds"].(map[string]any)["min"].(float64) != 2 || fs["price"].(map[string]any)["max"].(float64) != 1500000 {
+		t.Errorf("filter = %v", fs)
+	}
+	if _, ok := fs["price"].(map[string]any)["min"]; ok {
+		t.Error("a whole-borough search has no price floor")
+	}
+	for _, k := range []string{"fsba", "fsbo", "nc", "cmsn", "auc", "fore", "sf", "tow", "mf", "land", "manu"} {
+		if fs[k].(map[string]any)["value"] != false {
+			t.Errorf("%s = %v", k, fs[k])
+		}
+	}
+	if _, ok := fs["wat"]; ok {
+		t.Error("NYC searches have no waterfront filter")
+	}
+}
+
+func TestSoldSearchSplit(t *testing.T) {
+	s := NewSoldSearch(NYCBoroughs[2], "12m")
+	lo, hi, ok := s.Split()
+	if !ok || lo.MinPrice != 0 || lo.MaxPrice != 750000 || hi.MinPrice != 750001 || hi.MaxPrice != 1500000 {
+		t.Fatalf("split = %+v %+v %v", lo, hi, ok)
+	}
+	if hi.Label() != "queens $750,001-1,500,000" || hi.Window != "12m" {
+		t.Errorf("label %q window %q", hi.Label(), hi.Window)
+	}
+	fs := queryOf(t, hi.URL(1))["filterState"].(map[string]any)
+	if p := fs["price"].(map[string]any); p["min"].(float64) != 750001 || p["max"].(float64) != 1500000 {
+		t.Errorf("price = %v", p)
+	}
+	// Halving stops at $25 000 steps.
+	narrow := SoldSearch{Borough: NYCBoroughs[0], MinPrice: 400001, MaxPrice: 425000}
+	if _, _, ok := narrow.Split(); ok {
+		t.Error("a $25k band must not split")
+	}
+}
+
+func TestBoroughs(t *testing.T) {
+	want := map[string]int{"manhattan": 12530, "brooklyn": 37607, "queens": 270915, "bronx": 17182, "staten_island": 27252}
+	if len(NYCBoroughs) != len(want) {
+		t.Fatal(NYCBoroughs)
+	}
+	for _, b := range NYCBoroughs {
+		if want[b.Slug] != b.RegionID {
+			t.Errorf("%s = %d", b.Slug, b.RegionID)
+		}
+	}
+}
+
+// testdata/nyc_sold.html: Staten Island, recently sold (6 months), 2+ beds,
+// page 1 of 8 (302 results), trimmed to 9 results: CONDO and APARTMENT
+// rows (Zillow types units of one building either way: 55 Austin Pl 6B is a
+// CONDO, 7K an APARTMENT), and an undisclosed address.
+func TestParseNYCSold(t *testing.T) {
+	p, err := ParseNYCSold(readFixture(t, "nyc_sold.html"), NYCBoroughs[4])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.TotalPages != 8 || p.TotalResults != 302 || len(p.Listings) != 8 || p.Dropped != 1 {
+		t.Fatalf("pages %d results %d listings %d dropped %d", p.TotalPages, p.TotalResults, len(p.Listings), p.Dropped)
+	}
+	byID := map[string]listing.Listing{}
+	for _, l := range p.Listings {
+		byID[l.ID] = l
+		if l.Market != "nyc" || l.Source != "zillow" || l.Status != "sold" || !l.CompOnly || l.SoldAt == nil ||
+			deref(l.Borough) != "staten_island" || l.Neighborhood != nil || l.County != nil || l.Area != nil ||
+			l.WaterType != nil || l.LotSqft != nil || l.DaysOnMarket != nil {
+			t.Errorf("listing = %+v", l)
+		}
+	}
+	l := byID["zl:32286071"]
+	checks := []struct {
+		name      string
+		got, want any
+	}{
+		{"address", l.Address, "55 Austin Pl"},
+		{"unit", deref(l.Unit), "#6B"},
+		{"price", l.Price, 450000},
+		{"beds", deref(l.Beds), 2},
+		{"baths", deref(l.Baths), 2.0},
+		{"sqft", deref(l.Sqft), 1122},
+		{"homeType", l.HomeType, "condo"},
+		{"zip", deref(l.Zip), "10304"},
+		{"city", deref(l.City), "Staten Island"},
+		{"url", l.URL, "https://www.zillow.com/homedetails/55-Austin-Pl-APT-6B-Staten-Island-NY-10304/32286071_zpid/"},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
+		}
+	}
+	if l.Lat == nil || l.Lon == nil || *l.Lat < 40.5 || *l.Lat > 40.7 {
+		t.Errorf("lat/lon = %v %v", l.Lat, l.Lon)
+	}
+	// APARTMENT is not a building type: "other", for the scorer to settle.
+	if a := byID["zl:32286101"]; a.HomeType != "other" || a.Address != "55 Austin Pl" || deref(a.Unit) != "#7K" {
+		t.Errorf("apartment = %+v", a)
+	}
+	if b := byID["zl:460789199"]; b.Address != "50 Fort Pl" || deref(b.Unit) != "#B3-B/A" {
+		t.Errorf("unit with a slash = %q %q", b.Address, deref(b.Unit))
+	}
+	if b := byID["zl:32324102"]; b.Address != "99 Stonegate Dr" || b.Unit != nil {
+		t.Errorf("no unit = %q %v", b.Address, b.Unit)
+	}
+}
+
+func TestParseNYCSoldDropsTransfersAndUsesTheSearchedBorough(t *testing.T) {
+	html := `<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"searchPageState":{"cat1":{
+		"searchList":{"totalPages":1,"totalResultCount":3},"searchResults":{"listResults":[
+		{"zpid":"1","statusType":"SOLD","unformattedPrice":16273,"addressStreet":"404 Park Ave S APT 9C","hdpData":{"homeInfo":{"dateSold":1791183600000,"zipcode":"10016"}}},
+		{"zpid":"2","statusType":"SOLD","unformattedPrice":700000,"addressStreet":"1 Main St UNIT 4C","hdpData":{"homeInfo":{"dateSold":1791183600000,"homeType":"COOPERATIVE"}}},
+		{"zpid":"3","statusType":"FOR_SALE","unformattedPrice":700000,"addressStreet":"2 Main St","hdpData":{"homeInfo":{}}}
+	]}}}}}}</script>`
+	p, err := ParseNYCSold(html, NYCBoroughs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Listings) != 1 || p.Dropped != 2 {
+		t.Fatalf("listings %d dropped %d", len(p.Listings), p.Dropped)
+	}
+	l := p.Listings[0]
+	if deref(l.Borough) != "manhattan" || l.HomeType != "coop" || l.Address != "1 Main St" || deref(l.Unit) != "#4C" {
+		t.Errorf("listing = %+v", l)
+	}
+}
+
+func TestSplitUnit(t *testing.T) {
+	for in, want := range map[string][2]string{
+		"1408 Avenue O APT 3B":     {"1408 Avenue O", "3B"},
+		"1235 Forest Hill Rd #2E":  {"1235 Forest Hill Rd", "2E"},
+		"7 Shirra Avenue #A":       {"7 Shirra Avenue", "A"},
+		"150 W 51st St APT 2116":   {"150 W 51st St", "2116"},
+		"10 West End Ave Unit 4c":  {"10 West End Ave", "4C"},
+		"38B Jennifer Pl":          {"38B Jennifer Pl", ""},
+		"1408 Avenue O":            {"1408 Avenue O", ""},
+		"166-25 Powells Cove Blvd": {"166-25 Powells Cove Blvd", ""},
+	} {
+		a, u := SplitUnit(in)
+		if a != want[0] || u != want[1] {
+			t.Errorf("SplitUnit(%q) = %q, %q", in, a, u)
+		}
+	}
 }

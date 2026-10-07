@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -49,6 +50,13 @@ func site(t *testing.T, sold bool) fetch.Pages {
 	}
 	for _, c := range zillow.Counties {
 		p[zillow.SearchURL(c, 1, sold)] = body
+	}
+	if sold {
+		// Every borough answers with the Staten Island page (302 results).
+		nyc := fixture(t, "../zillow/testdata/nyc_sold.html")
+		for _, b := range zillow.NYCBoroughs {
+			p[zillow.NewSoldSearch(b, "").URL(1)] = nyc
+		}
 	}
 	return p
 }
@@ -226,7 +234,7 @@ func TestDryRunPrintsJSONAndPushesNothing(t *testing.T) {
 	}
 }
 
-func TestSoldModeIsMichiganOnlyAndCompOnly(t *testing.T) {
+func TestSoldModeCrawlsZillowSoldForBothMarkets(t *testing.T) {
 	api := &fakeAPI{}
 	var out bytes.Buffer
 	res := Run(context.Background(), Config{
@@ -236,19 +244,151 @@ func TestSoldModeIsMichiganOnlyAndCompOnly(t *testing.T) {
 	if len(res.Failures) != 0 {
 		t.Fatal(res.Failures)
 	}
-	if len(api.pushes) != 6 || api.pushes[0].scope.Mode != "sold" || api.pushes[0].scope.Source != "zillow" {
-		t.Errorf("pushes = %+v", api.pushes)
+	// NYC: one push (the other boroughs answer the same, already seen, rows), then the six counties.
+	if len(api.pushes) != 7 {
+		t.Fatalf("pushes = %+v", api.pushes)
+	}
+	for i, p := range api.pushes {
+		want := "mi"
+		if i == 0 {
+			want = "nyc"
+		}
+		if p.scope.Mode != "sold" || p.scope.Source != "zillow" || p.scope.Market != want {
+			t.Errorf("push %d = %+v", i, p)
+		}
+	}
+	if api.pushes[0].n != 8 {
+		t.Errorf("nyc sold rows pushed = %d", api.pushes[0].n)
 	}
 	if api.asked != nil {
 		t.Error("sold mode reads no detail pages")
 	}
+	markets := map[string]int{}
 	for _, l := range res.Listings {
-		if l.Status != "sold" || !l.CompOnly || l.SoldAt == nil {
+		markets[l.Market]++
+		if l.Status != "sold" || !l.CompOnly || l.SoldAt == nil || l.Source != "zillow" {
 			t.Fatalf("listing = %+v", l)
 		}
+		if l.Market == "nyc" && (l.Borough == nil || l.County != nil || l.Neighborhood != nil) {
+			t.Fatalf("nyc listing = %+v", l)
+		}
+	}
+	if markets["nyc"] != 8 || markets["mi"] != 24 {
+		t.Errorf("markets = %v", markets)
 	}
 	if out.Len() != 0 {
 		t.Error("only --dry-run writes to stdout")
+	}
+}
+
+// zlSoldSite answers any Zillow NYC sold search with the NYC sold fixture,
+// rewritten so each request has its own zpids, the given result count and
+// 2 pages. It records "borough:min-max:page" per request.
+type zlSoldSite struct {
+	body  string
+	count func(region, min, max int) int
+	asked []string
+}
+
+func (z *zlSoldSite) Fetch(_ context.Context, u string) (string, error) {
+	pu, err := url.Parse(u)
+	if err != nil {
+		return "", err
+	}
+	var q struct {
+		Pagination struct {
+			CurrentPage int `json:"currentPage"`
+		} `json:"pagination"`
+		RegionSelection []struct {
+			RegionID int `json:"regionId"`
+		} `json:"regionSelection"`
+		FilterState struct {
+			Price struct {
+				Min int `json:"min"`
+				Max int `json:"max"`
+			} `json:"price"`
+		} `json:"filterState"`
+	}
+	if err := json.Unmarshal([]byte(pu.Query().Get("searchQueryState")), &q); err != nil || len(q.RegionSelection) != 1 {
+		return "", &fetch.HTTPError{Status: 404, URL: u}
+	}
+	region, lo, hi := q.RegionSelection[0].RegionID, q.FilterState.Price.Min, q.FilterState.Price.Max
+	z.asked = append(z.asked, fmt.Sprintf("%d:%d-%d:%d", region, lo, hi, q.Pagination.CurrentPage))
+	body := strings.ReplaceAll(z.body, `"zpid":"`, fmt.Sprintf(`"zpid":"%d0`, len(z.asked)))
+	body = strings.Replace(body, `"totalResultCount":302`, fmt.Sprintf(`"totalResultCount":%d`, z.count(region, lo, hi)), 1)
+	body = strings.Replace(body, `"totalPages":8`, `"totalPages":2`, 1)
+	return body, nil
+}
+
+func TestSoldModeSplitsZillowNYCIntoPriceBands(t *testing.T) {
+	site := &zlSoldSite{
+		body: fixture(t, "../zillow/testdata/nyc_sold.html"),
+		count: func(region, lo, hi int) int {
+			switch {
+			case region != 270915: // Queens only is too big
+				return 300
+			case lo == 0 && hi == 1500000:
+				return 2600
+			case lo == 0 && hi == 750000:
+				return 1300
+			}
+			return 650
+		},
+	}
+	var logs bytes.Buffer
+	res := Run(context.Background(), Config{
+		Mode: ModeSold, Markets: []string{"nyc"}, DetailLimit: -1, DryRun: true,
+		Fetcher: site, Log: log.New(&logs, "", 0), Now: now,
+	})
+	if len(res.Failures) != 0 {
+		t.Fatalf("failures %v\n%s", res.Failures, logs.String())
+	}
+	want := []string{
+		"12530:0-1500000:1", "12530:0-1500000:2",
+		"37607:0-1500000:1", "37607:0-1500000:2",
+		"270915:0-1500000:1", // probe, split
+		"270915:0-750000:1",  // probe, split again
+		"270915:0-375000:1", "270915:0-375000:2",
+		"270915:375001-750000:1", "270915:375001-750000:2",
+		"270915:750001-1500000:1", "270915:750001-1500000:2",
+		"17182:0-1500000:1", "17182:0-1500000:2",
+		"27252:0-1500000:1", "27252:0-1500000:2",
+	}
+	if fmt.Sprint(site.asked) != fmt.Sprint(want) {
+		t.Errorf("asked\n %v\nwant\n %v", site.asked, want)
+	}
+	if len(res.Listings) != len(want)*8 {
+		t.Errorf("listings = %d, want %d pages x 8", len(res.Listings), len(want))
+	}
+	for _, s := range []string{
+		"zillow nyc queens: 2600 results > 780, splitting at $750000",
+		"zillow nyc queens $0-750,000: 1300 results > 780, splitting at $375000",
+		"zillow nyc queens $375,001-750,000 sold: pages 2/2, listings 16",
+		"zillow nyc sold queens: 64 sold rows (window 6m), 138 of 150 requests left",
+	} {
+		if !strings.Contains(logs.String(), s) {
+			t.Errorf("log lacks %q\n%s", s, logs.String())
+		}
+	}
+}
+
+func TestNYCSoldStopsAtTheRequestBudgetWithAWarning(t *testing.T) {
+	defer func(n int) { NYCSoldBudget = n }(NYCSoldBudget)
+	NYCSoldBudget = 5
+	site := &zlSoldSite{body: fixture(t, "../zillow/testdata/nyc_sold.html"), count: func(int, int, int) int { return 300 }}
+	var logs bytes.Buffer
+	res := Run(context.Background(), Config{
+		Mode: ModeSold, Markets: []string{"nyc"}, DetailLimit: -1, DryRun: true,
+		Fetcher: site, Log: log.New(&logs, "", 0), Now: now,
+	})
+	if len(res.Failures) != 0 {
+		t.Fatalf("a spent budget is not a failure: %v", res.Failures)
+	}
+	if len(site.asked) != 5 || len(res.Listings) != 5*8 {
+		t.Errorf("asked %d, listings %d", len(site.asked), len(res.Listings))
+	}
+	if !strings.Contains(logs.String(), "WARNING zillow nyc queens: stopping zillow at page 2: request budget spent") {
+		t.Errorf("logs:\n%s", logs.String())
 	}
 }
 
@@ -475,14 +615,14 @@ func TestScoringPagesRunsTheScorerAndPostsChunksAlertsFirst(t *testing.T) {
 		`],"alerts":[` + strings.Join(alerts, ",") + `],"stats":{}}`}
 	var logs bytes.Buffer
 	res := Run(context.Background(), Config{
-		Mode: ModeSold, Markets: []string{"nyc", "mi"}, MaxPages: 1, DetailLimit: -1,
+		Mode: ModeSold, Markets: []string{"mi"}, MaxPages: 1, DetailLimit: -1,
 		Fetcher: site(t, true), API: api, Scorer: sc, Log: log.New(&logs, "", 0), Now: now,
 	})
 	if len(res.Failures) != 0 {
 		t.Fatalf("failures %v\n%s", res.Failures, logs.String())
 	}
 	if fmt.Sprint(api.inputs) != `[mi "" 2 mi "zl:2" 2 mi "zl:4" 2]` {
-		t.Errorf("score-input calls %v (sold mode crawls Michigan only)", api.inputs)
+		t.Errorf("score-input calls %v", api.inputs)
 	}
 	if len(sc.inputs) != 1 || sc.inputs[0]["market"] != "mi" || sc.inputs[0]["now"] != "2026-10-05T12:00:00Z" ||
 		len(sc.inputs[0]["rows"].([]any)) != 5 || fmt.Sprint(sc.inputs[0]["columns"]) != "[id]" {

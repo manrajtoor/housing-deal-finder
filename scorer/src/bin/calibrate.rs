@@ -2,12 +2,18 @@
 //! the discounts are distributed (DESIGN.md "Calibration").
 //!
 //!     cargo run --release --features calibrate --bin calibrate -- \
-//!         d1-export.sql [--water mi-water.txt] [--market nyc|mi] [--top 25]
+//!         d1-export.sql [--water mi-water.txt] [--sold crawled.json] [--market nyc|mi] [--top 25]
 //!
 //! The input is the SQL text of `wrangler d1 export` (or a SQLite file:
 //! `.db`/`.sqlite`). `--water` fills Michigan water from lines
 //! `id|waterType|waterBody` (the map classifier's output for the rows'
-//! lat/lon) where the row has none. Nothing is written anywhere.
+//! lat/lon) where the row has none. `--sold` merges crawled listings (the
+//! crawler's `--dry-run` JSON `{"listings": [...]}`, a JSON array, or NDJSON)
+//! into the dump, replacing rows with the same id: e.g. NYC sold rows from
+//! `housedeals --dry-run --mode sold --market nyc`. NYC sold rows are placed
+//! (building type, neighbourhood) as the crawl job places them
+//! (`scorer::nyc_sold`), and the placement is printed. Nothing is written
+//! anywhere.
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -18,10 +24,11 @@ use serde_json::{Map, Value};
 use scorer::listing::Facts;
 use scorer::{Options, Refusal, Score, Scorer};
 
-/// The listing columns of GET /api/score-input (no lat/lon or description:
-/// the scorer sees what production sees), plus `last_seen` to date "now".
+/// The listing columns of GET /api/score-input (no description: the scorer
+/// sees what production sees), plus `last_seen` to date "now".
 const COLUMNS: &[(&str, &str)] = &[
     ("id", "id"), ("market", "market"), ("status", "status"), ("url", "url"), ("address", "address"),
+    ("lat", "lat"), ("lon", "lon"),
     ("unit", "unit"), ("city", "city"), ("price", "price"), ("sold_at", "soldAt"), ("beds", "beds"),
     ("baths", "baths"), ("sqft", "sqft"), ("lot_sqft", "lotSqft"), ("home_type", "homeType"),
     ("neighborhood", "neighborhood"), ("borough", "borough"), ("county", "county"), ("area", "area"),
@@ -62,6 +69,31 @@ fn load(path: &str) -> Result<Vec<Map<String, Value>>, String> {
     rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
 }
 
+/// Crawled listings: `{"listings": [...]}` (crawler --dry-run), a JSON array,
+/// or one listing per line. Only score-input's fields are kept.
+fn load_crawled(path: &str) -> Result<Vec<Map<String, Value>>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let items: Vec<Value> = match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(mut o)) => match o.remove("listings") {
+            Some(Value::Array(a)) => a,
+            _ => return Err(format!("{path}: an object without a \"listings\" array")),
+        },
+        Ok(Value::Array(a)) => a,
+        _ => text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).map_err(|e| format!("{path}: {e}")))
+            .collect::<Result<_, _>>()?,
+    };
+    Ok(items
+        .into_iter()
+        .filter_map(|v| match v {
+            Value::Object(o) => Some(COLUMNS.iter().map(|(_, k)| (k.to_string(), o.get(*k).cloned().unwrap_or(Value::Null))).collect()),
+            _ => None,
+        })
+        .collect())
+}
+
 fn pct(sorted: &[f64], p: f64) -> f64 {
     scorer::stats::Sorted::new(sorted).percentile(p).unwrap_or(f64::NAN)
 }
@@ -85,8 +117,8 @@ impl Seg {
 
 fn header() {
     println!(
-        "  {:<34} {:>6} {:>6} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>5} {:>5} {:>5}",
-        "segment", "subj", "priced", "share", "p5", "p25", "median", "p75", "p95", ">=15", ">=40", "alert"
+        "  {:<34} {:>6} {:>6} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>5} {:>5} {:>5} {:>5}",
+        "segment", "subj", "priced", "share", "p5", "p25", "median", "p75", "p95", ">=15", ">=25", ">=40", "alert"
     );
 }
 
@@ -96,7 +128,7 @@ fn row(name: &str, s: &Seg) {
     let n = d.len();
     let ge = |t: f64| d.iter().filter(|x| **x >= t).count();
     println!(
-        "  {:<34} {:>6} {:>6} {:>5.0}% {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>5} {:>5} {:>5}",
+        "  {:<34} {:>6} {:>6} {:>5.0}% {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>5} {:>5} {:>5} {:>5}",
         name.chars().take(34).collect::<String>(),
         s.subjects,
         n,
@@ -107,6 +139,7 @@ fn row(name: &str, s: &Seg) {
         pct(&d, 75.0),
         pct(&d, 95.0),
         ge(15.0),
+        ge(25.0),
         ge(40.0),
         s.alerts
     );
@@ -128,10 +161,46 @@ fn refusal_key(r: &Refusal) -> String {
     }
 }
 
+/// NYC sold rows: how many got a building type and a neighbourhood, per borough.
+fn print_placement(st: &scorer::nyc_sold::Stats, listings: &[Value], now: &str, days: i64) {
+    let cutoff = scorer::dates::date_minus_days(now, days).unwrap_or_default();
+    let recent = listings
+        .iter()
+        .filter(|l| l["status"] == "sold" && l["soldAt"].as_str().is_some_and(|s| s.len() >= 10 && s[..10] >= *cutoff.as_str()))
+        .count();
+    println!("\nNYC sold rows: {recent} sold since {cutoff}");
+    println!(
+        "  {:<14} {:>6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>7}",
+        "borough", "sold", "type:SE", "type:zlCo", "type:none", "nbhd:bldg", "nbhd:knn", "none", "usable"
+    );
+    let line = |name: &str, b: &scorer::nyc_sold::BoroughStats| {
+        let p = |n: usize| format!("{} {:>2.0}%", n, 100.0 * n as f64 / b.sold.max(1) as f64);
+        println!(
+            "  {:<14} {:>6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>7}",
+            name,
+            b.sold,
+            p(b.type_from_streeteasy),
+            p(b.type_from_zillow_coop),
+            p(b.type_uncertain),
+            p(b.nbhd_from_building),
+            p(b.nbhd_from_neighbours),
+            p(b.nbhd_none),
+            p(b.usable)
+        );
+    };
+    for (k, b) in &st.by_borough {
+        line(k, b);
+    }
+    line("ALL", &st.total());
+    let pairs: Vec<String> = st.zillow_vs_streeteasy.iter().map(|((z, s), n)| format!("{z}→{s} {n}")).collect();
+    println!("  Zillow type → StreetEasy type (typed rows): {}", pairs.join(", "));
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut path = None;
     let mut water = None;
+    let mut sold: Option<String> = None;
     let mut only: Option<String> = None;
     let mut top = 25usize;
     let mut opts = Options::default();
@@ -139,6 +208,7 @@ fn main() -> ExitCode {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--water" => water = it.next().cloned(),
+            "--sold" => sold = it.next().cloned(),
             "--market" => only = it.next().cloned(),
             "--top" => top = it.next().and_then(|t| t.parse().ok()).unwrap_or(25),
             // Experiments: --set name=value for the numeric Options.
@@ -166,7 +236,7 @@ fn main() -> ExitCode {
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: calibrate d1-export.sql [--water id|type|body file] [--market nyc|mi] [--top N]");
+        eprintln!("usage: calibrate d1-export.sql [--water id|type|body file] [--sold crawled.json] [--market nyc|mi] [--top N]");
         return ExitCode::from(2);
     };
     let mut rows = match load(&path) {
@@ -197,6 +267,20 @@ fn main() -> ExitCode {
         }
         println!("water filled from {w}: {filled} rows");
     }
+    if let Some(p) = &sold {
+        let crawled = match load_crawled(p) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("calibrate: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let ids: std::collections::HashSet<String> = crawled.iter().filter_map(|c| c["id"].as_str().map(str::to_string)).collect();
+        let before = rows.len();
+        rows.retain(|r| !r["id"].as_str().is_some_and(|id| ids.contains(id)));
+        println!("merged {} crawled rows from {p} ({} replaced dump rows)", crawled.len(), before - rows.len());
+        rows.extend(crawled);
+    }
     let now = rows.iter().filter_map(|r| r["lastSeen"].as_str()).max().unwrap_or("2026-10-05T12:00:00Z").to_string();
     println!("{path}: {} rows, now = {now}", rows.len());
 
@@ -204,9 +288,15 @@ fn main() -> ExitCode {
         if only.as_deref().is_some_and(|m| m != market) {
             continue;
         }
-        let listings: Vec<Value> = rows.iter().filter(|r| r["market"] == market).cloned().map(Value::Object).collect();
+        let mut listings: Vec<Value> = rows.iter().filter(|r| r["market"] == market).cloned().map(Value::Object).collect();
         if listings.is_empty() {
             continue;
+        }
+        if market == "nyc" {
+            let st = scorer::nyc_sold::enrich(&mut listings);
+            if !st.by_borough.is_empty() {
+                print_placement(&st, &listings, &now, opts.sold_comp_days);
+            }
         }
         let scorer = Scorer::new(&listings, opts.clone(), &now);
         let results: Vec<(Facts, &Value, Result<Score, Refusal>)> = listings

@@ -9,9 +9,9 @@ All money is whole US dollars, all times ISO-8601 UTC strings.
 | `id` | string | `se:<streeteasy id>` or `zl:<zpid>`. Primary key. |
 | `source` | `"streeteasy"` \| `"zillow"` | |
 | `market` | `"nyc"` \| `"mi"` | |
-| `status` | `"active"` \| `"sold"` | Sold rows are comps only (Michigan). |
+| `status` | `"active"` \| `"sold"` | Sold rows are comps only (Michigan; NYC from Zillow's recently sold search). |
 | `url` | string | Absolute https URL of the listing. |
-| `address` | string | Street address. |
+| `address` | string | Street address (NYC Zillow sold rows: without the unit, which goes to `unit`). |
 | `unit` | string? | NYC unit, e.g. `#4D`. |
 | `city` | string? | |
 | `zip` | string? | |
@@ -23,9 +23,9 @@ All money is whole US dollars, all times ISO-8601 UTC strings.
 | `sqft` | int? | Living area. Null when unknown (never 0). |
 | `lotSqft` | int? | Lot area in sq ft (acres × 43 560). |
 | `yearBuilt` | int? | |
-| `homeType` | string | `condo` `coop` `townhouse` `single_family` `multi_family` `other` |
-| `neighborhood` | string? | NYC: StreetEasy `areaName`. |
-| `borough` | string? | NYC: `manhattan` `brooklyn` `queens` `bronx` `staten_island`. |
+| `homeType` | string | `condo` `coop` `townhouse` `single_family` `multi_family` `other`. Zillow: `CONDO` → `condo`, `COOPERATIVE` → `coop`, `APARTMENT` → `other` (NYC sold rows: the scorer settles the type from StreetEasy, see DESIGN.md "NYC sold comps"). |
+| `neighborhood` | string? | NYC: StreetEasy `areaName`. Null on NYC sold rows (Zillow); the scorer places them. |
+| `borough` | string? | NYC: `manhattan` `brooklyn` `queens` `bronx` `staten_island` (Zillow sold rows: from the ZIP, else the searched borough). |
 | `county` | string? | Michigan: `grand_traverse` `leelanau` `antrim` `benzie` `charlevoix` `emmet`. |
 | `area` | string? | Michigan: `traverse` (GT, Leelanau, Antrim, Benzie) or `petoskey` (Charlevoix, Emmet). |
 | `zestimate` | int? | Second opinion only. |
@@ -57,7 +57,7 @@ Crawler routes need `Authorization: Bearer <INGEST_TOKEN>`.
   (the crawler sends ≤ 10 a request; the Worker sets `waterSource` to `description` whenever `waterType` is given) → `{"updated","unknown","scored":0,"newAlerts":0,"rowsWritten"}`. Stores only.
 - `GET /api/score-input?market=nyc|mi&after=<id>&limit=<≤1000>` (the crawler asks 500) → `{"market","columns":[…],"rows":[[…]…],"last","n"}`:
   one page, by id, of the market's active unremoved listings and homes sold in the last 365 days.
-  Each row is an array in `columns` order: the Deal's listing fields, `status soldAt removedAt compOnly freshAt detailReadAt`,
+  Each row is an array in `columns` order: the Deal's listing fields, `lat lon` (to place NYC sold rows), `status soldAt removedAt compOnly freshAt detailReadAt`,
   and the stored score `storedDiscount storedAlert storedPrice scoredAt` (null when none). The next page asks `after=<last>`;
   a page with `n` < `limit` is the last. SQLite builds the whole body.
 - `POST /api/scores` body `{"market","upserts":[{"id","price","discountPct","alert","deal":Deal}],"deletes":["id"…],"alerts":[{"id","price","deal":Deal}]}`
@@ -77,7 +77,8 @@ Read bodies are built by SQLite from the stored Deal JSON and passed through.
 ## Scorer CLI (`housedeals-score`, scorer/)
 
 Reads `{"market","now","columns","rows"}` (the score-input pages joined) on stdin and writes
-`{"market","upserts","deletes","alerts","stats"}` on stdout. Flags: `--min-discount 15 --min-comps-nyc 8
+`{"market","upserts","deletes","alerts","stats"}` on stdout (`stats.nycSold`: NYC sold rows, how many got a
+StreetEasy building type, a neighbourhood, and both). Flags: `--min-discount 15 --min-comps-nyc 8
 --min-comps-mi 6 --max-price 900000 --fresh-hours 72`. No network.
 
 ## Deal (scorer output, stored in `listing_scores.deal` as JSON)
@@ -102,4 +103,4 @@ Listing fields shown on the dashboard (`id url address unit city neighborhood bo
 |---|---|
 | `*/30 * * * *` | `quick`: newest page per search, then needs-detail (≤ 6 detail pages per market), then scoring. |
 | `0 11 * * *` | `full`: every page per search, then needs-detail (≤ 20), then scoring. The Worker also expires active listings unseen for 3 days in this same cron and deletes the scores of removed listings. |
-| `0 12 * * SUN` | `sold`: Michigan sold in the last 12 months, then Michigan scoring. |
+| `0 12 * * SUN` | `sold`: Michigan sold in the last 12 months and NYC apartments sold in the last 6 months (Zillow, ≤ 150 requests), then scoring of both. |

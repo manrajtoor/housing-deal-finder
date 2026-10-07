@@ -28,6 +28,7 @@ func TestFlagErrors(t *testing.T) {
 		{[]string{"--mode", "quick"}, "pass --push URL or --dry-run"},
 		{[]string{"--mode", "quick", "--push", "https://api.example"}, "HOUSEDEALS_INGEST_TOKEN"},
 		{[]string{"--mode", "quick", "--dry-run", "extra"}, "unexpected arguments"},
+		{[]string{"--mode", "sold", "--dry-run", "--sold-window", "3m"}, "--sold-window must be"},
 		{[]string{"--mode", "quick", "--push", "https://api.example", "--scorer", "/no/such/housedeals-score"}, "pass --no-score"},
 	}
 	token := func(k string) string {

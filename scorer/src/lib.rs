@@ -10,6 +10,7 @@
 //! - [`alert`]   the alert rule
 //! - [`stats`]   medians and percentiles (with one element left out)
 //! - [`dates`]   ISO date arithmetic
+//! - [`nyc_sold`] building type and neighbourhood of NYC sold rows (Zillow), from StreetEasy rows
 //! - [`batch`]   one market's scoring pass for the crawl job (`housedeals-score`)
 
 pub mod alert;
@@ -17,6 +18,7 @@ pub mod batch;
 pub mod dates;
 pub mod group;
 pub mod listing;
+pub mod nyc_sold;
 pub mod score;
 pub mod stats;
 

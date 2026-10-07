@@ -72,12 +72,17 @@ impl ScoreInputQuery {
 
 /// (name in the output, column of the page subquery, expression in json_array).
 /// Names are the contract's camelCase fields, plus the stored score.
-pub const INPUT_COLUMNS: [(&str, &str, &str); 34] = [
+/// `lat`/`lon` (with `address`) let the scorer place NYC sold rows, which
+/// have no StreetEasy neighbourhood, among the StreetEasy rows (scorer
+/// `nyc_sold`).
+pub const INPUT_COLUMNS: [(&str, &str, &str); 36] = [
     ("id", "l.id", "id"),
     ("url", "l.url", "url"),
     ("address", "l.address", "address"),
     ("unit", "l.unit", "unit"),
     ("city", "l.city", "city"),
+    ("lat", "l.lat", "lat"),
+    ("lon", "l.lon", "lon"),
     ("neighborhood", "l.neighborhood", "neighborhood"),
     ("borough", "l.borough", "borough"),
     ("county", "l.county", "county"),
@@ -512,6 +517,7 @@ mod tests {
         let s = score_input_query(&q, "2025-10-05");
         assert_eq!(s.params.len(), 4);
         assert!(s.sql.contains("\"storedDiscount\""), "{}", s.sql);
+        assert!(s.sql.contains("\"lat\",\"lon\"") && s.sql.contains("l.lat AS lat, l.lon AS lon"), "{}", s.sql);
     }
 
     #[test]

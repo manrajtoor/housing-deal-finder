@@ -9,7 +9,8 @@
 # unreliable at short intervals):
 #   */30 * * * *  mode=quick  newest page of each search, <= 6 detail pages
 #   0 11 * * *    mode=full   every page of each search, <= 20 detail pages
-#   0 12 * * 0    mode=sold   Michigan homes sold in the last 12 months
+#   0 12 * * 0    mode=sold   Michigan homes sold in the last 12 months, NYC
+#                             apartments sold in the last 6 months (Zillow, <= 150 requests)
 #
 # Setup (once, in the GitHub repo): Settings > Secrets and variables > Actions
 #   Secrets   > HOUSEDEALS_INGEST_TOKEN = the Worker's INGEST_TOKEN
@@ -25,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "quick (newest page), full (every page) or sold (Michigan sold comps)"
+        description: "quick (newest page), full (every page) or sold (sold comps: Michigan, NYC)"
         type: choice
         options: [quick, full, sold]
         default: quick

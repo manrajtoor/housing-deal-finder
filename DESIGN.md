@@ -25,13 +25,14 @@ just bind values and pass JSON strings through.
 | Source | Used for | Notes |
 |---|---|---|
 | StreetEasy search pages | NYC listings | Data in the Next.js RSC payload: id, areaName, bedroomCount, buildingType, livingAreaSize, price. ~86 a page. |
-| Zillow search pages | Michigan listings, active and sold | `__NEXT_DATA__` → `cat1.searchResults.listResults`, 41 a page. County regions + `isWaterfront`. |
+| Zillow search pages | Michigan listings, active and sold; NYC sold (comps) | `__NEXT_DATA__` → `cat1.searchResults.listResults`, 41 a page, at most 20 pages a search. County regions + `isWaterfront`; NYC borough regions (type 17) recently sold, 2+ beds, no houses. |
 | Zillow detail pages | Michigan water facts (when readable) | Only the description says which lake, how many feet and whether the frontage is private or shared, so it is parsed once per listing. Since 2026-10 Zillow answers 403 to runners on detail pages (search pages still work), so the map below is the usual source. |
 | OpenStreetMap (offline, embedded) | Michigan water type from lat/lon | Great Lakes shore and named inland lakes, © OpenStreetMap contributors, ODbL. See "Water from the map". |
 
 Redfin, Realtor.com, Homes.com, LandWatch and Compass block GitHub's runners.
 Craigslist (thin and noisy) and NYC DOF sold prices (no sq ft or beds for
-units) are possible later additions, not part of v1.
+units) are possible later additions. NYC sold prices come from Zillow (see
+"NYC sold comps").
 
 Zillow Group's terms forbid automated access. The owner accepted that: crawls
 stay small (1.5 s between requests, 6 s between detail pages, one process),
@@ -39,7 +40,8 @@ are for personal use only, and nothing is republished; the dashboard sits
 behind Access. Zillow answered 403 after 14 detail pages 1.5 s apart, so a
 run reads at most 6 (quick) or 20 (full) detail pages per market, and a
 blocked detail page ends that market's detail reads for the run with a
-warning, not a failed run.
+warning, not a failed run. The weekly NYC sold crawl makes at most 150
+requests (~110 on 2026-10-07); past that it stops with a warning.
 
 ## Comps go above the alert ceiling
 
@@ -163,9 +165,45 @@ The rest are rivers, ponds under 10 ha, unnamed lakes or bad geocodes. The
 one fixture with a read description (10 Island View Dr, "200 feet of private
 frontage on Island Lake") agrees with the map.
 
-Comps are active listings plus homes sold in the last 12 months. The sold ones
-use their sale price, which tends to sit a little under asking, so the
-baseline is conservative and alerts lean toward fewer false positives.
+Comps are active listings plus homes sold in the last 12 months (both
+markets). The sold ones use their sale price, which tends to sit a little
+under asking, so the baseline is conservative and alerts lean toward fewer
+false positives. Sold rows are never subjects.
+
+**NYC sold comps.** The weekly `sold` crawl reads Zillow's recently-sold
+search per borough (Manhattan 12530, Brooklyn 37607, Queens 270915, Bronx
+17182, Staten Island 27252, region type 17), 2+ beds, no houses, townhouses,
+multi-family, land or manufactured homes, up to $1.5M, split into price bands
+of ≤ 780 results the way StreetEasy's full sweep is (Zillow serves 20 pages
+of 41). The window is 6 months (`--sold-window`): 12 months is ~7 900 sales,
+~200 pages, over the 150-request budget, and sold rows stay in D1 (score-input
+keeps those sold in the last 365 days), so weekly 6-month windows hold a full
+year after six months. Rows: `zl:<zpid>`, `status: sold`, `compOnly`,
+`soldAt`, address without the unit (the unit goes to `unit`), borough from
+the ZIP, no neighbourhood. Sales under $100k (transfers, parking, typos) and
+undisclosed addresses are dropped.
+
+Zillow's type is not usable: of the sold rows matched to a StreetEasy
+building, 791 Zillow `CONDO`s were co-ops and 381 condos, and `APARTMENT`
+(14 condo, 8 co-op) means nothing either; no row said `COOPERATIVE`. So the
+scorer, which has every NYC row, places each sold row before scoring
+(`scorer/src/nyc_sold.rs`):
+
+- building type: the StreetEasy rows at the same address in the same borough
+  (normalised: unit cut off, `Avenue`/`Ave`, `Street`/`St`, `East`/`E`,
+  `Fifth`/`5`, `21st`/`21`, Queens hyphens and spaces ignored), majority
+  condo / co-op, a tie is no answer. Without a match only an explicit
+  Zillow `COOPERATIVE` is kept; anything else becomes `other`, so the row
+  joins no group (not a comp);
+- neighbourhood: that building's StreetEasy neighbourhood when it has
+  StreetEasy rows, else the majority of the 5 nearest StreetEasy rows within
+  600 m in the same borough (ties: the nearest); none near, no group.
+
+This needs `lat`/`lon` in score-input (added 2026-10-07). On the 2026-10-07
+data (3 997 sales in 6 months: Manhattan 1 200, Brooklyn 1 057, Queens
+1 231, Bronx 330, Staten Island 179) 30% got a StreetEasy type (StreetEasy
+lists ~4 400 apartments, so most sold buildings have nothing for sale now),
+88% a neighbourhood, and 30% (1 194) both, i.e. became comps.
 
 **Alert rule:** ≥ 25% under baseline (the `housedeals-score` default; see
 Calibration for why not 15%), ≥ 6 comps (Michigan) or ≥ 8 (NYC), not
@@ -182,14 +220,16 @@ when a listing is new and young in a quick crawl (not a market's first run),
 relisted or cheaper, and the scorer alerts on it for 72 hours from then.
 
 **Calibration.** `cargo run --release --features calibrate --bin calibrate
--- d1-export.sql [--water map.txt]` (scorer/src/bin/calibrate.rs; SQLite
-only in that feature) loads a `wrangler d1 export`, scores each market as
-the crawl job does (same columns as score-input: no lat/lon, no
-description) and prints the share priced, the discount distribution and
+-- d1-export.sql [--water map.txt] [--sold crawled.json]`
+(scorer/src/bin/calibrate.rs; SQLite only in that feature) loads a
+`wrangler d1 export`, scores each market as the crawl job does (same
+columns as score-input: no description) and prints the share priced, the discount distribution and
 counts ≥ 15% / ≥ 40% by level, basis, type, borough or water, the refusals
 by reason, and the top listings with their group, n, basis, sq ft and comps'
 p25/p75. `--water` fills Michigan water from `id|type|body` lines (the map
-classifier's output for the rows' lat/lon); `--set name=value` tries other
+classifier's output for the rows' lat/lon); `--sold` merges crawled
+listings (a crawler `--dry-run` JSON or NDJSON, e.g. NYC sold rows) and
+prints how the NYC sold rows were placed; `--set name=value` tries other
 Options. Results on the 2026-10-05 export (4 345 NYC, 248 Michigan rows,
 Michigan water filled from the map):
 
@@ -216,6 +256,18 @@ the live threshold is 25% (`--min-discount` to change it).
 Sharper baselines would need building-level facts (year built, maintenance
 for every co-op, lat/lon in score-input for radius comps).
 
+NYC sold comps, 2026-10-07 export (4 444 NYC rows, 2 741 apartments) with
+and without the 3 997 crawled Zillow sales (1 194 of them usable comps):
+
+| | priced | p5 | p25 | median | p75 | p95 | ≥ 15% | ≥ 25% |
+|---|---|---|---|---|---|---|---|---|
+| active only | 940 | −37.8 | −14.9 | −2.1 | 9.2 | 25.4 | 145 (15.4%) | 52 (5.5%) |
+| with sold | 1 120 | −34.5 | −13.2 | −2.0 | 9.0 | 24.6 | 164 (14.6%) | 54 (4.8%) |
+
+Coverage of apartments goes from 34% to 41% (Manhattan 217 → 288, Queens
+361 → 415, Brooklyn 295 → 347), the lower tail tightens (more comps per
+group) and the deal tail barely moves.
+
 **Stored scores.** The scorer scores every active listing of the market
 against all of its rows and rewrites a stored score only when it is missing,
 its discount moved by 0.5 point or more, its alert flag flipped, the price
@@ -230,7 +282,8 @@ listings.
 - Daily 11:00 UTC: full sweep of every page (keeps `last_seen` honest), up to
   20 detail pages per market, scoring, plus expiry of listings unseen for
   3 days.
-- Weekly: Michigan sold comps, then Michigan scoring.
+- Weekly: Michigan sold comps (12 months) and NYC sold comps (6 months,
+  ≤ 150 requests), then scoring of both.
 
 ## D1 budget
 
@@ -239,7 +292,8 @@ chunks of at most 10, to keep each Worker request's CPU small. Map water adds
 no reads: ingest's existing per-batch lookup also returns the stored water.
 
 
-~6 000 NYC + ~500 Michigan rows. Unchanged rows are not rewritten; `last_seen`
+~6 000 NYC + ~500 Michigan rows, plus NYC sales: ~650 a month, ~8 000 kept
+(365 days), so every NYC scoring run reads about twice the rows it did. Unchanged rows are not rewritten; `last_seen`
 is refreshed only every 20 h, so a daily sweep touches each row about once a
 day (~6 500 writes) plus price changes and new listings. Score writes are
 limited the same way: unchanged scores are not rewritten.

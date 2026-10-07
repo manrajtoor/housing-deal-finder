@@ -20,6 +20,8 @@
 //!  "stats":   {"rows", "subjects", "priced", "unchanged"}}
 //! ```
 //!
+//! NYC sold rows (Zillow) first get a building type and a neighbourhood from
+//! the StreetEasy rows (see [`crate::nyc_sold`]); they are comps only.
 //! Every active row is scored against all rows. A stored score is rewritten
 //! when it is missing, its discount moved by at least [`Settings::epsilon_pct`],
 //! its alert flag flipped, the asking price changed, or the detail page was
@@ -35,6 +37,7 @@ use serde_json::{json, Map, Value};
 use crate::alert::AlertRule;
 use crate::dates::iso_minus_hours;
 use crate::listing::Market;
+use crate::nyc_sold;
 use crate::score::{deal_json, Options, Scorer};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,10 +121,11 @@ pub fn run(input: &Value, s: &Settings) -> Result<Value, String> {
     let now = input.get("now").and_then(Value::as_str).ok_or("input needs \"now\" (ISO time)")?;
     let fresh_cutoff = iso_minus_hours(now, s.fresh_hours).ok_or("\"now\" is not an ISO time")?;
     let rows = rows_of(input, market)?;
-    let listings: Vec<Value> = rows
+    let mut listings: Vec<Value> = rows
         .iter()
         .map(|r| Value::Object(r.iter().filter(|(k, _)| !STORED_KEYS.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect()))
         .collect();
+    let sold = (market == Market::Nyc).then(|| nyc_sold::enrich(&mut listings).total());
     let scorer = Scorer::new(&listings, Options::with_rule(s.rule.clone()), now);
 
     let (mut upserts, mut deletes, mut alerts) = (Vec::new(), Vec::new(), Vec::new());
@@ -171,7 +175,9 @@ pub fn run(input: &Value, s: &Settings) -> Result<Value, String> {
         "upserts": upserts,
         "deletes": deletes,
         "alerts": alerts,
-        "stats": {"rows": rows.len(), "subjects": subjects, "priced": priced, "unchanged": unchanged},
+        "stats": {"rows": rows.len(), "subjects": subjects, "priced": priced, "unchanged": unchanged,
+                  "nycSold": sold.map(|t| json!({"rows": t.sold, "typedByStreetEasy": t.type_from_streeteasy,
+                                                  "placed": t.sold - t.nbhd_none, "usable": t.usable}))},
     }))
 }
 
@@ -295,6 +301,40 @@ mod tests {
         assert!(run(&inp, &strict).unwrap()["alerts"].as_array().unwrap().is_empty());
         let cheap = Settings { rule: AlertRule { max_price: 500_000.0, ..AlertRule::default() }, ..Settings::default() };
         assert!(run(&inp, &cheap).unwrap()["alerts"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn nyc_sold_rows_are_placed_and_counted_as_comps_but_never_scored() {
+        let se = |i: usize| {
+            json!({"id": format!("se:{i}"), "price": 800_000, "sqft": 1000, "beds": 2, "homeType": "condo",
+                   "neighborhood": "Astoria", "borough": "queens", "status": "active", "compOnly": false,
+                   "address": format!("{} 30th Street", 10 + i), "lat": 40.7644, "lon": -73.9235})
+        };
+        let sold = |i: usize, addr: &str, stored: bool| {
+            json!({"id": format!("zl:{i}"), "price": 790_000, "sqft": 1000, "beds": 2, "homeType": "condo",
+                   "borough": "queens", "status": "sold", "soldAt": "2026-08-01T00:00:00Z", "compOnly": true,
+                   "address": addr, "unit": "#2A", "lat": 40.7645, "lon": -73.9236,
+                   "storedDiscount": if stored { json!(5.0) } else { Value::Null }})
+        };
+        // 4 StreetEasy condos (too few alone), 4 Zillow sales in their buildings, a subject.
+        let mut rows: Vec<Value> = (0..4).map(se).collect();
+        rows.extend((0..4).map(|i| sold(100 + i, &format!("{} 30th St APT 2A", 10 + i), i == 0)));
+        // An uncertain Zillow CONDO nowhere near a StreetEasy building: not a comp.
+        rows.push(sold(200, "1 Nowhere Ave", false));
+        let mut subject = se(9);
+        subject["price"] = json!(600_000);
+        rows.push(subject);
+        let inp = json!({"market": "nyc", "now": NOW, "rows": rows});
+        let mut rule = AlertRule::default();
+        rule.min_comps_nyc = 8;
+        let out = run(&inp, &Settings { rule, ..Settings::default() }).unwrap();
+        let ups = out["upserts"].as_array().unwrap();
+        let s = ups.iter().find(|u| u["id"] == "se:9").expect("priced with the sold comps");
+        assert_eq!(s["deal"]["n"], 8, "4 StreetEasy + 4 sold comps");
+        assert!(ups.iter().all(|u| u["id"].as_str().unwrap().starts_with("se:")), "sold rows are never subjects");
+        assert_eq!(ids(&out, "deletes"), vec!["zl:100"], "a sold row's stray score is deleted");
+        assert_eq!(out["stats"]["subjects"], 5);
+        assert_eq!(out["stats"]["nycSold"], json!({"rows": 5, "typedByStreetEasy": 4, "placed": 5, "usable": 4}));
     }
 
     #[test]

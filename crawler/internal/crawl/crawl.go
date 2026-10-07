@@ -69,6 +69,9 @@ type Config struct {
 	// Scorer scores each market crawled after the searches and detail
 	// reads; nil skips scoring.
 	Scorer Scorer
+	// SoldWindow is the NYC sold search's window (Zillow "doz"); "" means
+	// zillow.NYCSoldWindow. Michigan sold searches always cover 12 months.
+	SoldWindow string
 	// DetailDelay spaces detail pages, on top of the Fetcher's own throttle.
 	DetailDelay time.Duration
 	Out         io.Writer
@@ -136,8 +139,12 @@ func Run(ctx context.Context, cfg Config) Result {
 	r.res.Details = []listing.Detail{}
 
 	var crawled []string
-	if r.has(listing.MarketNYC) && cfg.Mode != ModeSold {
-		r.streetEasy(ctx)
+	if r.has(listing.MarketNYC) {
+		if cfg.Mode == ModeSold {
+			r.zillowNYCSold(ctx)
+		} else {
+			r.streetEasy(ctx)
+		}
 		crawled = append(crawled, listing.MarketNYC)
 	}
 	if r.has(listing.MarketMI) {
@@ -240,7 +247,7 @@ func (r *runner) search(ctx context.Context, name, source, market string, seen m
 	push := r.push(ctx, all, source, market)
 	r.cfg.Log.Printf("%s %s: pages %d/%d, listings %d (dropped %d), %s", name, r.cfg.Mode, pages, total, len(all), dropped, push)
 	if stopErr != nil {
-		r.fail("%s: stopping %s at page %d: %v", name, source, pages+1, stopErr)
+		r.stopped(name, source, pages+1, stopErr)
 		return false
 	}
 	return true
@@ -293,40 +300,132 @@ func (r *runner) streetEasy(ctx context.Context) {
 		return
 	}
 	for _, area := range streeteasy.BoroughAreas {
-		if !r.seBand(ctx, streeteasy.Search{Area: area, MaxPrice: streeteasy.MaxSearchPrice}, seen, 0) {
+		if !r.walkBand(ctx, r.seBand(streeteasy.Search{Area: area, MaxPrice: streeteasy.MaxSearchPrice}), seen, 0) {
 			return
 		}
 	}
 }
 
-// seBand walks one search, or splits it when it reports too many results.
-// Page 1 of a split search is still pushed: it costs nothing more.
-// parentCount is the result count of the band this one was split from (0
-// for a borough): a half that reports as many results as its parent means
-// the price filter is not working, so it is walked, not split again.
-func (r *runner) seBand(ctx context.Context, s streeteasy.Search, seen map[string]bool, parentCount int) bool {
-	name := "streeteasy nyc " + s.Label()
-	fetchPage := r.sePage(s)
-	first, err := fetchPage(ctx, 1)
+// band is one search the band walker may split in two by price.
+type band struct {
+	name           string
+	source, market string
+	limit          int // most results a search may report and still be walked whole
+	pageCap        int // most pages the site serves for one search
+	maxPrice       int // the band's ceiling (logged where it splits)
+	fetch          pageFunc
+	split          func() (lo, hi band, ok bool)
+}
+
+func (r *runner) seBand(s streeteasy.Search) band {
+	return band{
+		name: "streeteasy nyc " + s.Label(), source: listing.SourceStreetEasy, market: listing.MarketNYC,
+		limit: streeteasy.BandLimit, pageCap: streeteasy.PageCap, maxPrice: s.MaxPrice, fetch: r.sePage(s),
+		split: func() (band, band, bool) {
+			lo, hi, ok := s.Split()
+			return r.seBand(lo), r.seBand(hi), ok
+		},
+	}
+}
+
+func (r *runner) zlSoldBand(s zillow.SoldSearch, f fetch.Fetcher) band {
+	return band{
+		name: "zillow nyc " + s.Label(), source: listing.SourceZillow, market: listing.MarketNYC,
+		limit: zillow.SoldBandLimit, pageCap: zillow.SoldPageCap, maxPrice: s.MaxPrice,
+		fetch: func(ctx context.Context, n int) (page, error) {
+			body, err := f.Fetch(ctx, s.URL(n))
+			if err != nil {
+				return page{}, err
+			}
+			p, err := zillow.ParseNYCSold(body, s.Borough)
+			if err != nil {
+				return page{}, err
+			}
+			return page{ls: p.Listings, totalPages: min(p.TotalPages, zillow.SoldPageCap), totalCount: p.TotalResults, dropped: p.Dropped}, nil
+		},
+		split: func() (band, band, bool) {
+			lo, hi, ok := s.Split()
+			return r.zlSoldBand(lo, f), r.zlSoldBand(hi, f), ok
+		},
+	}
+}
+
+// walkBand walks one search, or splits it when it reports more than its
+// limit of results. Page 1 of a split search is still pushed: it costs
+// nothing more. parentCount is the result count of the band this one was
+// split from (0 for a whole borough): a half that reports as many results as
+// its parent means the price filter is not working, so it is walked, not
+// split again.
+func (r *runner) walkBand(ctx context.Context, b band, seen map[string]bool, parentCount int) bool {
+	first, err := b.fetch(ctx, 1)
 	if err != nil {
-		r.fail("%s: stopping %s at page 1: %v", name, listing.SourceStreetEasy, err)
+		r.stopped(b.name, b.source, 1, err)
 		return false
 	}
-	lo, hi, ok := s.Split()
+	lo, hi, ok := b.split()
 	if parentCount > 0 && first.totalCount >= parentCount {
 		r.cfg.Log.Printf("%s: WARNING %d results, no fewer than the whole band; price filter ignored? walking the first %d pages only",
-			name, first.totalCount, streeteasy.PageCap)
+			b.name, first.totalCount, b.pageCap)
 		ok = false
 	}
-	if first.totalCount <= streeteasy.BandLimit || !ok {
-		return r.search(ctx, name, listing.SourceStreetEasy, listing.MarketNYC, seen, &first, fetchPage)
+	if first.totalCount <= b.limit || !ok {
+		return r.search(ctx, b.name, b.source, b.market, seen, &first, b.fetch)
 	}
-	r.cfg.Log.Printf("%s: %d results > %d, splitting at $%d", name, first.totalCount, streeteasy.BandLimit, lo.MaxPrice)
+	r.cfg.Log.Printf("%s: %d results > %d, splitting at $%d", b.name, first.totalCount, b.limit, lo.maxPrice)
 	first.totalPages = 1 // keep page 1, read the rest through the bands
-	if !r.search(ctx, name+" (page 1 before split)", listing.SourceStreetEasy, listing.MarketNYC, seen, &first, fetchPage) {
+	if !r.search(ctx, b.name+" (page 1 before split)", b.source, b.market, seen, &first, b.fetch) {
 		return false
 	}
-	return r.seBand(ctx, lo, seen, first.totalCount) && r.seBand(ctx, hi, seen, first.totalCount)
+	return r.walkBand(ctx, lo, seen, first.totalCount) && r.walkBand(ctx, hi, seen, first.totalCount)
+}
+
+// errBudget: the run's request budget for a source is spent.
+var errBudget = errors.New("request budget spent")
+
+// budget lets at most left requests through, then answers errBudget.
+type budget struct {
+	f    fetch.Fetcher
+	left int
+}
+
+func (b *budget) Fetch(ctx context.Context, u string) (string, error) {
+	if b.left <= 0 {
+		return "", errBudget
+	}
+	b.left--
+	return b.f.Fetch(ctx, u)
+}
+
+// NYCSoldBudget is the most requests one run makes for NYC sold comps
+// (a 6-month window is ~100 pages plus a probe per band split).
+var NYCSoldBudget = 150
+
+// zillowNYCSold reads Zillow's recently-sold search for each borough, split
+// into price bands of at most SoldBandLimit results (Zillow serves 20 pages
+// of 41). The rows are comps only: status sold, compOnly, soldAt. Building
+// type and neighbourhood are filled in by the scorer (scorer/src/nyc_sold.rs).
+func (r *runner) zillowNYCSold(ctx context.Context) {
+	f := &budget{f: r.cfg.Fetcher, left: NYCSoldBudget}
+	seen := map[string]bool{}
+	for _, b := range zillow.NYCBoroughs {
+		before := len(r.res.Listings)
+		ok := r.walkBand(ctx, r.zlSoldBand(zillow.NewSoldSearch(b, r.cfg.SoldWindow), f), seen, 0)
+		r.cfg.Log.Printf("zillow nyc sold %s: %d sold rows (window %s), %d of %d requests left",
+			b.Slug, len(r.res.Listings)-before, zillow.NewSoldSearch(b, r.cfg.SoldWindow).Window, f.left, NYCSoldBudget)
+		if !ok {
+			return
+		}
+	}
+}
+
+// stopped records why a source stopped at page n: a failure, or a warning
+// when only the run's request budget ran out.
+func (r *runner) stopped(name, source string, n int, err error) {
+	if errors.Is(err, errBudget) {
+		r.cfg.Log.Printf("WARNING %s: stopping %s at page %d: %v (the rest waits for the next run)", name, source, n, err)
+		return
+	}
+	r.fail("%s: stopping %s at page %d: %v", name, source, n, err)
 }
 
 func (r *runner) zillow(ctx context.Context) {
